@@ -1,0 +1,33 @@
+# Build artifacts
+target/
+*.swp
+*.swo
+*~
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# Documentation
+README.md
+*.md
+
+# CI/CD
+.github/
+
+# Docker
+Dockerfile
+.dockerignore
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+

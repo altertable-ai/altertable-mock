@@ -1,0 +1,62 @@
+[package]
+name = "altertable-mock"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+arrow-flight = { version = "56.2.0", features = ["flight-sql-experimental"] }
+arrow-schema = "56.2.0"
+arrow-array = "56.2.0"
+arrow-ipc = "56.2.0"
+tokio = { version = "1", features = ["full"] }
+tonic = "0.13"
+futures = "0.3"
+async-trait = "0.1"
+prost = "0.13"
+bytes = "1"
+tower = "0.5"
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1.18.1", features = ["v4"] }
+tower-http = { version = "0.6.6", features = ["trace"] }
+http = "1.3.1"
+base64 = "0.22.1"
+duckdb = { git = "https://github.com/altertable-ai/duckdb-rs", rev = "0bcaac429daf0ee387b516e4dc3ced589bb0767c", features = ["serde_json", "uuid", "chrono", "appender-arrow"] }
+tonic-async-interceptor = "0.13.0"
+anyhow = "1.0.100"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+chrono = "0.4.42"
+
+[lints.clippy]
+equatable_if_let = "warn"
+filter_map_next = "warn"
+fn_params_excessive_bools = "warn"
+if_let_mutex = "warn"
+implicit_clone = "warn"
+inefficient_to_string = "warn"
+manual_let_else = "warn"
+match_same_arms = "warn"
+match_wildcard_for_single_variants = "warn"
+needless_borrow = "warn"
+needless_continue = "warn"
+needless_pass_by_ref_mut = "warn"
+needless_pass_by_value = "warn"
+option_option = "warn"
+redundant_clone = "warn"
+ref_option = "warn"
+rest_pat_in_fully_bound_structs = "warn"
+return_self_not_must_use = "warn"
+single_match_else = "warn"
+str_to_string = "warn"
+suboptimal_flops = "warn"
+trivially_copy_pass_by_ref = "warn"
+uninlined_format_args = "warn"
+unnested_or_patterns = "warn"
+unused_self = "warn"
+use_self = "warn"
+verbose_file_reads = "warn"
+
+[features]
+bundled = ["duckdb/bundled"]
