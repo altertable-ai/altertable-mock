@@ -41,11 +41,14 @@ impl std::fmt::Display for OptionsParsingError {
     }
 }
 
+const CURSOR_FIELD_OPTION: &str = "cursor_field";
 const PRIMARY_KEY_OPTION: &str = "primary_key";
 const INGEST_CHANNEL_BUFFER: usize = 5;
 
+#[derive(Debug, Clone, Default)]
 struct StatementIngestOptions {
     primary_key: Vec<String>,
+    cursor_field: Vec<String>,
 }
 
 impl StatementIngestOptions {
@@ -54,9 +57,7 @@ impl StatementIngestOptions {
     }
 }
 
-impl TryFrom<HashMap<prost::alloc::string::String, prost::alloc::string::String>>
-    for StatementIngestOptions
-{
+impl TryFrom<HashMap<String, String>> for StatementIngestOptions {
     type Error = OptionsParsingError;
 
     fn try_from(value: HashMap<String, String>) -> Result<Self, Self::Error> {
@@ -72,7 +73,22 @@ impl TryFrom<HashMap<prost::alloc::string::String, prost::alloc::string::String>
             })?
             .unwrap_or_else(std::vec::Vec::new);
 
-        Ok(Self { primary_key })
+        let cursor_field = value
+            .get(CURSOR_FIELD_OPTION)
+            .map(|json| serde_json::from_str(json))
+            .transpose()
+            .map_err(|e| OptionsParsingError {
+                errors: HashMap::from([(
+                    CURSOR_FIELD_OPTION.to_owned(),
+                    format!("parsing error: {e}"),
+                )]),
+            })?
+            .unwrap_or_else(std::vec::Vec::new);
+
+        Ok(Self {
+            primary_key,
+            cursor_field,
+        })
     }
 }
 
@@ -276,7 +292,7 @@ pub async fn statement_ingest(
             catalog_name,
             schema_name,
             table_name,
-            &options.primary_key,
+            &options,
             schema,
             record_batch_stream,
         )
@@ -298,7 +314,7 @@ async fn upsert_record_batches<S>(
     catalog_name: impl SendableString,
     schema_name: impl SendableString,
     table_name: impl SendableString,
-    primary_key: &[String],
+    options: &StatementIngestOptions,
     schema: SchemaRef,
     record_batch_stream: S,
 ) -> Result<i64, Status>
@@ -337,7 +353,7 @@ where
         "{}.{}.\"{}\"",
         TEMP_DB,
         MAIN_SCHEMA,
-        escape_identifier(temp_table_name.as_str())
+        escape_identifier(&temp_table_name)
     );
     let full_target_table = format!(
         "\"{}\".\"{}\".\"{}\"",
@@ -346,7 +362,8 @@ where
         escape_identifier(table_name.as_str())
     );
 
-    let on_clause = primary_key
+    let on_clause = options
+        .primary_key
         .iter()
         .map(|col| {
             format!(
@@ -358,12 +375,51 @@ where
         .collect::<Vec<_>>()
         .join(" AND ");
 
-    let all_columns: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+    let distinct_on_clause = options
+        .primary_key
+        .iter()
+        .map(|col| format!("source.\"{}\"", escape_identifier(col)))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let all_columns: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+
+    let distinct_select_columns = all_columns
+        .iter()
+        .map(|col| format!("\"{}\"", escape_identifier(col)))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    // Build ORDER BY clause for DISTINCT ON to control which row is kept
+    let distinct_order_by = if !options.cursor_field.is_empty() {
+        // Order by primary key columns first, then by cursor_field(s) DESC to get the latest
+        let pk_order = options
+            .primary_key
+            .iter()
+            .map(|col| format!("\"{}\"", escape_identifier(col)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let cursor_order = options
+            .cursor_field
+            .iter()
+            .map(|col| format!("\"{}\" DESC", escape_identifier(col)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{pk_order}, {cursor_order}")
+    } else {
+        // Just order by primary key columns
+        options
+            .primary_key
+            .iter()
+            .map(|col| format!("\"{}\"", escape_identifier(col)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
 
     // Build the UPDATE SET clause (all columns except primary key)
     let update_set_clause = all_columns
         .iter()
-        .filter(|col| !primary_key.contains(col))
+        .filter(|&col| !options.primary_key.iter().any(|pk| pk == col))
         .map(|col| {
             format!(
                 "\"{}\" = source.\"{}\"",
@@ -373,6 +429,26 @@ where
         })
         .collect::<Vec<_>>()
         .join(", ");
+
+    // Build additional condition for WHEN MATCHED clause based on cursor_field
+    let when_matched_condition = if !options.cursor_field.is_empty() {
+        // Use tuple comparison for multiple cursor fields
+        let source_fields = options
+            .cursor_field
+            .iter()
+            .map(|col| format!("source.\"{}\"", escape_identifier(col)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let target_fields = options
+            .cursor_field
+            .iter()
+            .map(|col| format!("target.\"{}\"", escape_identifier(col)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("AND ({source_fields}) > ({target_fields})")
+    } else {
+        String::new()
+    };
 
     // Build the INSERT columns and values
     let insert_columns = all_columns
@@ -390,14 +466,17 @@ where
     let merge_sql = format!(
         r#"
         MERGE INTO {full_target_table} AS target
-             USING {full_temp_table} AS source
+             USING (
+                SELECT DISTINCT ON ({distinct_on_clause}) {distinct_select_columns} 
+                FROM {full_temp_table} AS source
+                ORDER BY {distinct_order_by}
+             ) AS source
              ON {on_clause}
-             WHEN MATCHED THEN UPDATE SET {update_set_clause}
+             WHEN MATCHED {when_matched_condition} THEN UPDATE SET {update_set_clause}
              WHEN NOT MATCHED THEN INSERT ({insert_columns}) VALUES ({insert_values})
         "#
     );
 
-    tracing::debug!("Executing query: {}", merge_sql);
     let affected_rows = session
         .execute(merge_sql)
         .await
