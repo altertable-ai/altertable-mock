@@ -192,7 +192,7 @@ pub async fn statement_ingest(
         escape_identifier(&table_name)
     );
 
-    let table_exists = session
+    let mut table_exists = session
         .table_exists(
             catalog_name.clone(),
             schema_name.clone(),
@@ -245,6 +245,7 @@ pub async fn statement_ingest(
                     )
                     .await
                     .map_err(|_| Status::internal("Failed to drop table"))?;
+                table_exists = false;
             }
             _ => {}
         }
