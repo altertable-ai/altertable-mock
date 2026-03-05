@@ -43,7 +43,7 @@ jobs:
       - name: Lint
         run: |
           cargo fmt -- --check
-          cargo clippy --all-targets --features bundled -- -D warnings
+          cargo clippy --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --all-targets --features bundled
+        run: cargo test --all-targets

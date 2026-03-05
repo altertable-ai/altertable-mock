@@ -107,9 +107,8 @@ curl -u alice:secret -X POST http://localhost:15000/query \
 
 ## Building from source
 
-DuckDB is linked as a shared library. The `scripts/install_duckdb_libs.sh` script downloads the prebuilt `libduckdb` for Linux x86_64. See the `Dockerfile` for the exact build steps.
+DuckDB is compiled in via the `bundled` feature, so no external shared library is required.
 
 ```bash
-bash scripts/install_duckdb_libs.sh /usr/local/lib
 cargo build --release
 ```
