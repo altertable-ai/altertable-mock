@@ -1,5 +1,6 @@
 mod flight;
 mod lakehouse;
+mod product_analytics;
 mod session;
 mod utils;
 
@@ -15,6 +16,9 @@ use tracing::info;
 use tracing_subscriber::{self, EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 use lakehouse::{auth::auth_middleware, handlers as lh, state::LakehouseState};
+use product_analytics::{
+    auth::auth_middleware as pa_auth_middleware, handlers as pa, state::ProductAnalyticsState,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "altertable-mock")]
@@ -36,8 +40,29 @@ struct Args {
     )]
     lakehouse_port: u16,
 
-    #[arg(short, long, env = "ALTERTABLE_MOCK_USERS", value_delimiter = ',')]
+    #[arg(
+        short = 'a',
+        long,
+        default_value_t = 15001,
+        env = "ALTERTABLE_MOCK_ANALYTICS_PORT"
+    )]
+    analytics_port: u16,
+
+    #[arg(
+        short = 'u',
+        long,
+        env = "ALTERTABLE_MOCK_USERS",
+        value_delimiter = ','
+    )]
     user: Vec<String>,
+
+    #[arg(
+        short = 'k',
+        long,
+        env = "ALTERTABLE_MOCK_API_KEYS",
+        value_delimiter = ','
+    )]
+    api_key: Vec<String>,
 }
 
 #[tokio::main]
@@ -118,6 +143,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .expect("Lakehouse HTTP server failed");
     });
 
+    // ── Product Analytics HTTP server ─────────────────────────────────────────
+    let api_keys: Arc<std::collections::HashSet<String>> =
+        Arc::new(args.api_key.into_iter().collect());
+    let analytics_state = ProductAnalyticsState::new(api_keys);
+    let analytics_addr =
+        format!("0.0.0.0:{}", args.analytics_port).parse::<std::net::SocketAddr>()?;
+
+    let analytics_router = Router::new()
+        .route("/track", routing::post(pa::post_track))
+        .route("/identify", routing::post(pa::post_identify))
+        .route_layer(middleware::from_fn_with_state(
+            analytics_state.clone(),
+            pa_auth_middleware,
+        ))
+        .with_state(analytics_state);
+
+    let analytics_handle = tokio::spawn(async move {
+        info!(
+            "Starting Product Analytics HTTP server on {}",
+            analytics_addr
+        );
+        let listener = tokio::net::TcpListener::bind(analytics_addr)
+            .await
+            .expect("Failed to bind analytics port");
+        axum::serve(listener, analytics_router)
+            .await
+            .expect("Product Analytics HTTP server failed");
+    });
+
     tokio::try_join!(
         async {
             flight_handle
@@ -126,6 +180,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         async {
             lakehouse_handle
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+        },
+        async {
+            analytics_handle
                 .await
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
         },
