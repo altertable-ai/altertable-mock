@@ -490,111 +490,36 @@ async fn execute_query(
             .map(|f| f.name().clone())
             .collect();
 
-        let mut rows: Vec<Vec<Value>> = Vec::new();
+        let mut buf = Vec::new();
+        let mut writer = arrow_json::WriterBuilder::new()
+            .with_struct_mode(arrow_json::StructMode::ListOnly)
+            .build::<_, arrow_json::writer::LineDelimited>(&mut buf);
         for batch in &arrow_batches {
-            for row_idx in 0..batch.num_rows() {
-                let mut row = Vec::with_capacity(batch.num_columns());
-                for col_idx in 0..batch.num_columns() {
-                    let col = batch.column(col_idx);
-                    let val = arrow_scalar_to_json(col.as_ref(), row_idx);
-                    row.push(val);
-                }
-                rows.push(row);
-            }
+            writer
+                .write(batch)
+                .map_err(|e| anyhow::anyhow!("Failed to serialize batch: {e}"))?;
         }
+        writer
+            .finish()
+            .map_err(|e| anyhow::anyhow!("Failed to finish JSON writer: {e}"))?;
+
+        let rows: Vec<Vec<Value>> = buf
+            .split(|&b| b == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                serde_json::from_slice::<Value>(line)
+                    .map(|v| match v {
+                        Value::Array(arr) => arr,
+                        other => vec![other],
+                    })
+                    .unwrap_or_default()
+            })
+            .collect();
 
         Ok((columns, rows))
     })
     .await
     .map_err(|e| anyhow::anyhow!("Task join error: {e}"))?
-}
-
-fn arrow_scalar_to_json(array: &dyn arrow_array::Array, idx: usize) -> Value {
-    use arrow_array::cast::AsArray;
-    use arrow_schema::DataType;
-
-    if array.is_null(idx) {
-        return Value::Null;
-    }
-
-    match array.data_type() {
-        DataType::Boolean => Value::Bool(array.as_boolean().value(idx)),
-        DataType::Int8 => Value::Number(
-            array
-                .as_primitive::<arrow_array::types::Int8Type>()
-                .value(idx)
-                .into(),
-        ),
-        DataType::Int16 => Value::Number(
-            array
-                .as_primitive::<arrow_array::types::Int16Type>()
-                .value(idx)
-                .into(),
-        ),
-        DataType::Int32 => Value::Number(
-            array
-                .as_primitive::<arrow_array::types::Int32Type>()
-                .value(idx)
-                .into(),
-        ),
-        DataType::Int64 => Value::Number(
-            array
-                .as_primitive::<arrow_array::types::Int64Type>()
-                .value(idx)
-                .into(),
-        ),
-        DataType::UInt8 => Value::Number(
-            array
-                .as_primitive::<arrow_array::types::UInt8Type>()
-                .value(idx)
-                .into(),
-        ),
-        DataType::UInt16 => Value::Number(
-            array
-                .as_primitive::<arrow_array::types::UInt16Type>()
-                .value(idx)
-                .into(),
-        ),
-        DataType::UInt32 => Value::Number(
-            array
-                .as_primitive::<arrow_array::types::UInt32Type>()
-                .value(idx)
-                .into(),
-        ),
-        DataType::UInt64 => Value::Number(
-            array
-                .as_primitive::<arrow_array::types::UInt64Type>()
-                .value(idx)
-                .into(),
-        ),
-        DataType::Float32 => {
-            let v = array
-                .as_primitive::<arrow_array::types::Float32Type>()
-                .value(idx) as f64;
-            serde_json::Number::from_f64(v)
-                .map(Value::Number)
-                .unwrap_or(Value::Null)
-        }
-        DataType::Float64 => {
-            let v = array
-                .as_primitive::<arrow_array::types::Float64Type>()
-                .value(idx);
-            serde_json::Number::from_f64(v)
-                .map(Value::Number)
-                .unwrap_or(Value::Null)
-        }
-        DataType::Utf8 => Value::String(array.as_string::<i32>().value(idx).to_owned()),
-        DataType::LargeUtf8 => Value::String(array.as_string::<i64>().value(idx).to_owned()),
-        DataType::Binary => Value::String(base64::Engine::encode(
-            &base64::prelude::BASE64_STANDARD,
-            array.as_binary::<i32>().value(idx),
-        )),
-        DataType::LargeBinary => Value::String(base64::Engine::encode(
-            &base64::prelude::BASE64_STANDARD,
-            array.as_binary::<i64>().value(idx),
-        )),
-        _ => Value::String(format!("{array:?}[{idx}]")),
-    }
 }
 
 trait IntoObject {
