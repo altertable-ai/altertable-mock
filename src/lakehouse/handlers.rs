@@ -99,6 +99,7 @@ pub async fn post_query(
         Ok((columns, rows)) => {
             // Stream NDJSON: header line, column names line, then data rows
             let header = QueryStreamHeader {
+                query_id,
                 statement: statement.clone(),
                 rows_limit: limit,
                 connections_errors: HashMap::new(),
@@ -659,6 +660,38 @@ mod tests {
         assert_eq!(cols[0], "n");
         let row: Value = serde_json::from_str(lines[2]).unwrap();
         assert_eq!(row[0], 42);
+    }
+
+    #[tokio::test]
+    async fn post_query_response_contains_query_id() {
+        let app = make_router(make_state());
+        let query_id = uuid::Uuid::new_v4().to_string();
+        let body = serde_json::json!({
+            "statement": "SELECT 1",
+            "query_id": query_id,
+        });
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/query")
+                    .header(header::AUTHORIZATION, basic_auth_header())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        let header_line = text.lines().next().expect("expected NDJSON header line");
+        let header: Value = serde_json::from_str(header_line).unwrap();
+        assert_eq!(header["query_id"], query_id);
     }
 
     #[tokio::test]

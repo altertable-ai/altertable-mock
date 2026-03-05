@@ -88,4 +88,5 @@ pub struct QueryStreamHeader {
     pub rows_limit: Option<u64>,
     pub connections_errors: HashMap<String, String>,
     pub session_id: String,
+    pub query_id: Uuid,
 }

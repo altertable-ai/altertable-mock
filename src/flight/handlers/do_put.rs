@@ -504,6 +504,7 @@ where
     let (tx, mut rx) = tokio::sync::mpsc::channel::<RecordBatch>(INGEST_CHANNEL_BUFFER);
 
     let connection = session.connection.clone();
+    #[allow(clippy::result_large_err)]
     let writer_handle = tokio::task::spawn_blocking(move || {
         let conn = connection
             .lock()
