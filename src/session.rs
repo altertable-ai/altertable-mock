@@ -12,7 +12,7 @@ use duckdb::{
 use tokio::sync::RwLock;
 
 use crate::{
-    schema_extractor::{extract_parameter_schema, extract_schema},
+    flight::schema_extractor::{extract_parameter_schema, extract_schema},
     utils::{SendableString, TEMP_DB, empty_params, escape_identifier, escape_literal},
 };
 

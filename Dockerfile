@@ -33,6 +33,7 @@ RUN apt-get update && apt-get -y install --no-install-recommends \
 COPY --from=builder /opt/duckdb/libduckdb* /usr/lib/
 COPY --from=builder /app/target/release/altertable-mock /usr/local/bin/altertable-mock
 
+EXPOSE 15000
 EXPOSE 15002
 ENV RUST_LOG=info
 
