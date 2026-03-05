@@ -8,11 +8,12 @@ use arrow_schema::{DataType, Schema};
 use duckdb::{
     Connection, Params,
     arrow::{array::RecordBatch, datatypes::SchemaRef},
+    core::{LogicalTypeHandle, LogicalTypeId},
 };
 use tokio::sync::RwLock;
 
 use crate::{
-    schema_extractor::{extract_parameter_schema, extract_schema},
+    flight::schema_extractor::{extract_parameter_schema, extract_schema},
     utils::{SendableString, TEMP_DB, empty_params, escape_identifier, escape_literal},
 };
 
@@ -254,26 +255,61 @@ pub fn create_schema_if_not_exists(
     Ok(())
 }
 
-#[allow(clippy::match_same_arms)]
-pub fn arrow_type_to_duckdb_type(data_type: &DataType) -> anyhow::Result<&'static str> {
-    let duckdb_type = match data_type {
-        DataType::Boolean => "BOOLEAN",
-        DataType::Int8 => "TINYINT",
-        DataType::Int16 => "SMALLINT",
-        DataType::Int32 => "INTEGER",
-        DataType::Int64 => "BIGINT",
-        DataType::UInt8 => "UTINYINT",
-        DataType::UInt16 => "USMALLINT",
-        DataType::UInt32 => "UINTEGER",
-        DataType::UInt64 => "UBIGINT",
-        DataType::Float32 => "FLOAT",
-        DataType::Float64 => "DOUBLE",
-        DataType::Utf8 | DataType::LargeUtf8 => "VARCHAR",
-        DataType::Binary | DataType::LargeBinary => "BLOB",
-        DataType::Date32 => "DATE",
-        DataType::Time64(_) => "TIME",
-        DataType::Timestamp(_, _) => "TIMESTAMP",
-        _ => return Err(anyhow::anyhow!("unsupported arrow type: {data_type}")),
-    };
-    Ok(duckdb_type)
+pub fn arrow_type_to_duckdb_type(
+    data_type: &DataType,
+) -> anyhow::Result<std::borrow::Cow<'static, str>> {
+    let logical_type = duckdb::vtab::to_duckdb_logical_type(data_type)
+        .map_err(|e| anyhow::anyhow!("failed to convert arrow type to duckdb logical type: {e}"))?;
+    duckdb_logical_type_to_string(&logical_type)
+}
+
+fn duckdb_logical_type_to_string(
+    logical_type: &LogicalTypeHandle,
+) -> anyhow::Result<std::borrow::Cow<'static, str>> {
+    match logical_type.id() {
+        LogicalTypeId::Boolean => Ok("BOOLEAN".into()),
+        LogicalTypeId::Tinyint => Ok("TINYINT".into()),
+        LogicalTypeId::Smallint => Ok("SMALLINT".into()),
+        LogicalTypeId::Integer => Ok("INTEGER".into()),
+        LogicalTypeId::Bigint => Ok("BIGINT".into()),
+        LogicalTypeId::UTinyint => Ok("UTINYINT".into()),
+        LogicalTypeId::USmallint => Ok("USMALLINT".into()),
+        LogicalTypeId::UInteger => Ok("UINTEGER".into()),
+        LogicalTypeId::UBigint => Ok("UBIGINT".into()),
+        LogicalTypeId::Float => Ok("FLOAT".into()),
+        LogicalTypeId::Double => Ok("DOUBLE".into()),
+        LogicalTypeId::Timestamp => Ok("TIMESTAMP".into()),
+        LogicalTypeId::Date => Ok("DATE".into()),
+        LogicalTypeId::Time => Ok("TIME".into()),
+        LogicalTypeId::Interval => Ok("INTERVAL".into()),
+        LogicalTypeId::Hugeint => Ok("HUGEINT".into()),
+        LogicalTypeId::Varchar => Ok("VARCHAR".into()),
+        LogicalTypeId::Blob => Ok("BLOB".into()),
+        LogicalTypeId::Decimal => {
+            let precision = logical_type.decimal_width();
+            let scale = logical_type.decimal_scale();
+            Ok(format!("DECIMAL({precision}, {scale})").into())
+        }
+        LogicalTypeId::TimestampS => Ok("TIMESTAMP_S".into()),
+        LogicalTypeId::TimestampMs => Ok("TIMESTAMP_MS".into()),
+        LogicalTypeId::TimestampNs => Ok("TIMESTAMP_NS".into()),
+        LogicalTypeId::Enum => Ok("ENUM".into()),
+        LogicalTypeId::List => Ok("LIST".into()),
+        LogicalTypeId::Struct => {
+            let num_children = logical_type.num_children();
+            let field_strs: anyhow::Result<Vec<_>> = (0..num_children)
+                .map(|i| {
+                    let field_name = logical_type.child_name(i);
+                    let field_type = logical_type.child(i);
+                    let type_str = duckdb_logical_type_to_string(&field_type)?;
+                    Ok(format!("{field_name} {type_str}"))
+                })
+                .collect();
+            Ok(format!("STRUCT({})", field_strs?.join(", ")).into())
+        }
+        LogicalTypeId::Map => Ok("MAP".into()),
+        LogicalTypeId::Uuid => Ok("UUID".into()),
+        LogicalTypeId::Union => Ok("UNION".into()),
+        LogicalTypeId::TimestampTZ => Ok("TIMESTAMP WITH TIME ZONE".into()),
+    }
 }

@@ -15,7 +15,9 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::handlers::{do_action, do_get, do_handshake::handshake, do_put, get_flight_info};
+use crate::flight::handlers::{
+    do_action, do_get, do_handshake::handshake, do_put, get_flight_info,
+};
 
 type Result<T> = std::result::Result<T, Status>;
 type FlightDataStream = BoxStream<'static, Result<FlightData>>;

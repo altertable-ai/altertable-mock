@@ -15,7 +15,7 @@ use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
 use crate::{
-    handlers::messages::{
+    flight::handlers::messages::{
         CloseSessionResult, SetSessionOptionsRequest, SetSessionOptionsResult,
         SetSessionOptionsResultError, close_session_result, session_option_value,
         set_session_options_result_error,

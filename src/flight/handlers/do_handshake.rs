@@ -3,7 +3,7 @@ use base64::{Engine, prelude::BASE64_STANDARD};
 use futures::stream::{self, BoxStream};
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::layers::auth::{Identity, SessionID};
+use crate::flight::layers::auth::{Identity, SessionID};
 
 type Result<T> = std::result::Result<T, Status>;
 
