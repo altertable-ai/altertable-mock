@@ -79,6 +79,7 @@ impl AsyncInterceptor for SessionMiddleware {
 
                 let lakehouse =
                     get_or_create_lakehouse(key.0.clone(), lakehouse_store.clone()).await;
+                #[allow(clippy::result_large_err)]
                 let new_conn = tokio::task::spawn_blocking(move || {
                     lakehouse
                         .lock()

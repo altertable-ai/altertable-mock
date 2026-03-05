@@ -59,6 +59,7 @@ impl AuthMiddleware {
 }
 
 impl Interceptor for AuthMiddleware {
+    #[allow(clippy::result_large_err)]
     fn call(&mut self, mut req: Request<()>) -> Result<Request<()>, Status> {
         let (identity, session) = self
             .authenticate_with_scheme(&req, b"Basic")
