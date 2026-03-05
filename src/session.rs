@@ -255,13 +255,17 @@ pub fn create_schema_if_not_exists(
     Ok(())
 }
 
-pub fn arrow_type_to_duckdb_type(data_type: &DataType) -> anyhow::Result<std::borrow::Cow<'static, str>> {
+pub fn arrow_type_to_duckdb_type(
+    data_type: &DataType,
+) -> anyhow::Result<std::borrow::Cow<'static, str>> {
     let logical_type = duckdb::vtab::to_duckdb_logical_type(data_type)
         .map_err(|e| anyhow::anyhow!("failed to convert arrow type to duckdb logical type: {e}"))?;
     duckdb_logical_type_to_string(&logical_type)
 }
 
-fn duckdb_logical_type_to_string(logical_type: &LogicalTypeHandle) -> anyhow::Result<std::borrow::Cow<'static, str>> {
+fn duckdb_logical_type_to_string(
+    logical_type: &LogicalTypeHandle,
+) -> anyhow::Result<std::borrow::Cow<'static, str>> {
     match logical_type.id() {
         LogicalTypeId::Boolean => Ok("BOOLEAN".into()),
         LogicalTypeId::Tinyint => Ok("TINYINT".into()),
