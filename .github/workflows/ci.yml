@@ -23,24 +23,27 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ~/.cargo/registry
-          key: cargo-registry-${{ runner.os }}-${{ hashFiles('api/Cargo.lock') }}
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-registry-${{ runner.os }}-
 
       - name: Restore build cache
         uses: actions/cache/restore@v4
         with:
-          path: api/target
-          key: cargo-build-${{ runner.os }}-${{ hashFiles('api/Cargo.lock') }}
+          path: target
+          key: cargo-build-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-build-${{ runner.os }}-
 
       - name: Setup Rust
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.89.0
+          components: rustfmt, clippy
 
       - name: Lint
         run: |
           cargo fmt -- --check
           cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --all-targets
