@@ -23,9 +23,18 @@ pub async fn post_track(
     let payloads = req.into_vec();
 
     for payload in payloads {
-        let env_state = state
-            .get_or_create_environment(&api_key.0, &payload.environment)
-            .await;
+        let Some(env_state) = state
+            .get_environment(&api_key.0, &payload.environment)
+            .await
+        else {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(TrackResponse {
+                    ok: false,
+                    error_code: Some("environment-not-found".to_owned()),
+                }),
+            );
+        };
 
         let result = tokio::task::spawn_blocking(move || {
             let env = env_state.lock().unwrap();
@@ -77,9 +86,18 @@ pub async fn post_identify(
     let payloads = req.into_vec();
 
     for payload in payloads {
-        let env_state = state
-            .get_or_create_environment(&api_key.0, &payload.environment)
-            .await;
+        let Some(env_state) = state
+            .get_environment(&api_key.0, &payload.environment)
+            .await
+        else {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(IdentifyResponse {
+                    ok: false,
+                    error_code: Some("environment-not-found".to_owned()),
+                }),
+            );
+        };
 
         let result = tokio::task::spawn_blocking(move || {
             let env = env_state.lock().unwrap();
@@ -389,7 +407,14 @@ mod tests {
     fn make_state() -> ProductAnalyticsState {
         let mut set = HashSet::new();
         set.insert(TEST_API_KEY.to_owned());
-        ProductAnalyticsState::new(Arc::new(set))
+        ProductAnalyticsState::with_environments(
+            Arc::new(set),
+            &[
+                "production".to_owned(),
+                "prod".to_owned(),
+                "staging".to_owned(),
+            ],
+        )
     }
 
     fn api_key_header() -> (&'static str, &'static str) {
@@ -414,8 +439,9 @@ mod tests {
         sql: &str,
     ) -> Vec<serde_json::Value> {
         let env_state = state
-            .get_or_create_environment(TEST_API_KEY, environment)
-            .await;
+            .get_environment(TEST_API_KEY, environment)
+            .await
+            .expect("environment not found in test state");
         let sql = sql.to_owned();
         tokio::task::spawn_blocking(move || {
             let env = env_state.lock().unwrap();
@@ -552,6 +578,66 @@ mod tests {
     }
 
     // ── POST /track ───────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn track_unknown_environment_returns_environment_not_found() {
+        let (key, val) = api_key_header();
+        let app = make_router(make_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/track")
+                    .header(key, val)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"event":"e","environment":"non-existent-environment","properties":{}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({ "ok": false, "error_code": "environment-not-found" })
+        );
+    }
+
+    #[tokio::test]
+    async fn identify_unknown_environment_returns_environment_not_found() {
+        let (key, val) = api_key_header();
+        let app = make_router(make_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/identify")
+                    .header(key, val)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"distinct_id":"user_1","environment":"non-existent-environment"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({ "ok": false, "error_code": "environment-not-found" })
+        );
+    }
 
     #[tokio::test]
     async fn track_single_event_returns_ok() {

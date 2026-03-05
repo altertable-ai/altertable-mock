@@ -76,33 +76,43 @@ pub struct ProductAnalyticsState {
 }
 
 impl ProductAnalyticsState {
-    pub fn new(allowed_api_keys: Arc<std::collections::HashSet<String>>) -> Self {
+    /// Create state pre-seeded with the given environment names. If `environments` is empty,
+    /// a single `"production"` environment is created for every API key.
+    ///
+    /// Because environments are keyed per API key and the set of keys is fixed at startup,
+    /// we create one `EnvironmentState` per (api_key, environment) pair up front.
+    pub fn with_environments(
+        allowed_api_keys: Arc<std::collections::HashSet<String>>,
+        environments: &[String],
+    ) -> Self {
+        let env_names: Vec<&str> = if environments.is_empty() {
+            vec!["production"]
+        } else {
+            environments.iter().map(|s| s.as_str()).collect()
+        };
+
+        let mut store = HashMap::new();
+        for api_key in allowed_api_keys.iter() {
+            for env_name in &env_names {
+                let key = (api_key.clone(), (*env_name).to_owned());
+                store.insert(key, Arc::new(Mutex::new(EnvironmentState::new())));
+            }
+        }
+
         Self {
-            environment_store: Arc::new(RwLock::new(HashMap::new())),
+            environment_store: Arc::new(RwLock::new(store)),
             allowed_api_keys,
         }
     }
 
-    pub async fn get_or_create_environment(
+    pub async fn get_environment(
         &self,
         username: &str,
         environment: &str,
-    ) -> Arc<Mutex<EnvironmentState>> {
+    ) -> Option<Arc<Mutex<EnvironmentState>>> {
         let key = (username.to_owned(), environment.to_owned());
-
-        {
-            let store = self.environment_store.read().await;
-            if let Some(env_state) = store.get(&key) {
-                return env_state.clone();
-            }
-        }
-
-        let env_state = Arc::new(Mutex::new(EnvironmentState::new()));
-        self.environment_store
-            .write()
-            .await
-            .insert(key, env_state.clone());
-        env_state
+        let store = self.environment_store.read().await;
+        store.get(&key).cloned()
     }
 }
 
