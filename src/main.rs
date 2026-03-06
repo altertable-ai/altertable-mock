@@ -63,6 +63,16 @@ struct Args {
         value_delimiter = ','
     )]
     api_key: Vec<String>,
+
+    /// Pre-created environment names for the Product Analytics server.
+    /// Defaults to a single "production" environment when omitted.
+    #[arg(
+        short = 'e',
+        long,
+        env = "ALTERTABLE_MOCK_ENVIRONMENTS",
+        value_delimiter = ','
+    )]
+    environment: Vec<String>,
 }
 
 #[tokio::main]
@@ -146,7 +156,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Product Analytics HTTP server ─────────────────────────────────────────
     let api_keys: Arc<std::collections::HashSet<String>> =
         Arc::new(args.api_key.into_iter().collect());
-    let analytics_state = ProductAnalyticsState::new(api_keys);
+    let analytics_state = ProductAnalyticsState::with_environments(api_keys, &args.environment);
     let analytics_addr =
         format!("0.0.0.0:{}", args.analytics_port).parse::<std::net::SocketAddr>()?;
 
