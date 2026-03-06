@@ -14,6 +14,8 @@ pub struct EnvironmentState {
 impl EnvironmentState {
     pub fn new() -> Self {
         let conn = Connection::open_in_memory().expect("Failed to open DuckDB in memory");
+        conn.execute_batch("LOAD json;")
+            .expect("Failed to load JSON extension");
         let state = Self {
             conn: Arc::new(Mutex::new(conn)),
         };
