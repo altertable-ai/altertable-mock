@@ -8,8 +8,8 @@ use crate::product_analytics::auth::ApiKey;
 use super::{
     state::{EnvironmentState, ProductAnalyticsState, new_uuid},
     types::{
-        IdentifyPayload, IdentifyRequest, IdentifyResponse, TrackPayload, TrackRequest,
-        TrackResponse,
+        AliasPayload, AliasRequest, AliasResponse, IdentifyPayload, IdentifyRequest,
+        IdentifyResponse, TrackPayload, TrackRequest, TrackResponse,
     },
 };
 
@@ -139,6 +139,69 @@ pub async fn post_identify(
     )
 }
 
+// ── /alias ────────────────────────────────────────────────────────────────────
+
+pub async fn post_alias(
+    State(state): State<ProductAnalyticsState>,
+    Extension(api_key): Extension<ApiKey>,
+    axum::Json(req): axum::Json<AliasRequest>,
+) -> impl IntoResponse {
+    let payloads = req.into_vec();
+
+    for payload in payloads {
+        let Some(env_state) = state
+            .get_environment(&api_key.0, &payload.environment)
+            .await
+        else {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(AliasResponse {
+                    ok: false,
+                    error_code: Some("environment-not-found".to_owned()),
+                }),
+            );
+        };
+
+        let result = tokio::task::spawn_blocking(move || {
+            let env = env_state.lock().unwrap();
+            merge_identities(&env, &payload.distinct_id, &payload.new_user_id)
+        })
+        .await;
+
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                warn!("Failed to alias identities: {}", e);
+                return (
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(AliasResponse {
+                        ok: false,
+                        error_code: Some("alias-failed".to_owned()),
+                    }),
+                );
+            }
+            Err(e) => {
+                warn!("Spawn blocking error: {}", e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::Json(AliasResponse {
+                        ok: false,
+                        error_code: Some("internal-error".to_owned()),
+                    }),
+                );
+            }
+        }
+    }
+
+    (
+        StatusCode::OK,
+        axum::Json(AliasResponse {
+            ok: true,
+            error_code: None,
+        }),
+    )
+}
+
 // ── Internal logic ────────────────────────────────────────────────────────────
 
 /// Insert a single event, resolving identity if a `distinct_id` is provided.
@@ -257,6 +320,47 @@ fn upsert_identity(env: &EnvironmentState, payload: &IdentifyPayload) -> Result<
     }
 
     let _ = now;
+    Ok(())
+}
+
+/// Merge the identity of `distinct_id` (source) into the identity of `new_user_id` (target).
+/// All distinct_id mappings and events from the source are re-pointed to the target, then
+/// the source identity row is deleted.
+fn merge_identities(
+    env: &EnvironmentState,
+    distinct_id: &str,
+    new_user_id: &str,
+) -> Result<(), anyhow::Error> {
+    let (target_uuid, _) = get_or_create_identity(env, new_user_id)?;
+    let (source_uuid, _) = get_or_create_identity(env, distinct_id)?;
+
+    if source_uuid == target_uuid {
+        return Ok(());
+    }
+
+    let conn = env.conn.lock().unwrap();
+
+    conn.execute(
+        "UPDATE identity_distinct_ids SET identity_uuid = ? WHERE identity_uuid = ?",
+        params![target_uuid, source_uuid],
+    )?;
+    conn.execute(
+        "UPDATE identity_distinct_id_overrides SET identity_uuid = ? WHERE identity_uuid = ?",
+        params![target_uuid, source_uuid],
+    )?;
+    conn.execute(
+        "UPDATE events SET identity_uuid = ? WHERE identity_uuid = ?",
+        params![target_uuid, source_uuid],
+    )?;
+    conn.execute(
+        "UPDATE identities SET is_identified = true, version = version + 1 WHERE uuid = ?",
+        params![target_uuid],
+    )?;
+    conn.execute(
+        "DELETE FROM identities WHERE uuid = ?",
+        params![source_uuid],
+    )?;
+
     Ok(())
 }
 

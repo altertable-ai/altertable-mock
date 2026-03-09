@@ -79,3 +79,36 @@ pub struct IdentifyResponse {
     pub ok: bool,
     pub error_code: Option<String>,
 }
+
+// ── Alias ─────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AliasPayload {
+    pub environment: String,
+    /// The source distinct_id to be merged away.
+    pub distinct_id: String,
+    /// The target user id that survives the merge.
+    pub new_user_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum AliasRequest {
+    Single(AliasPayload),
+    Batch(Vec<AliasPayload>),
+}
+
+impl AliasRequest {
+    pub fn into_vec(self) -> Vec<AliasPayload> {
+        match self {
+            Self::Single(p) => vec![p],
+            Self::Batch(v) => v,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct AliasResponse {
+    pub ok: bool,
+    pub error_code: Option<String>,
+}
