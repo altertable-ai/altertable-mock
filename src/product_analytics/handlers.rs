@@ -8,8 +8,8 @@ use crate::product_analytics::auth::ApiKey;
 use super::{
     state::{EnvironmentState, ProductAnalyticsState, new_uuid},
     types::{
-        AliasPayload, AliasRequest, AliasResponse, IdentifyPayload, IdentifyRequest,
-        IdentifyResponse, TrackPayload, TrackRequest, TrackResponse,
+        AliasRequest, AliasResponse, IdentifyPayload, IdentifyRequest, IdentifyResponse,
+        TrackPayload, TrackRequest, TrackResponse,
     },
 };
 
