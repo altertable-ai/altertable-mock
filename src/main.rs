@@ -163,6 +163,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let analytics_router = Router::new()
         .route("/track", routing::post(pa::post_track))
         .route("/identify", routing::post(pa::post_identify))
+        .route("/alias", routing::post(pa::post_alias))
         .route_layer(middleware::from_fn_with_state(
             analytics_state.clone(),
             pa_auth_middleware,
