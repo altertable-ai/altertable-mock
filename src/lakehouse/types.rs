@@ -34,10 +34,18 @@ pub struct ValidateRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
-#[allow(dead_code)]
 pub enum AppendRequest {
     Single(serde_json::Map<String, serde_json::Value>),
     Batch(Vec<serde_json::Map<String, serde_json::Value>>),
+}
+
+impl AppendRequest {
+    pub fn into_vec(self) -> Vec<serde_json::Map<String, serde_json::Value>> {
+        match self {
+            Self::Single(m) => vec![m],
+            Self::Batch(v) => v,
+        }
+    }
 }
 
 // --- Response types ---

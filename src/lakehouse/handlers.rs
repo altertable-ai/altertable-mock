@@ -20,7 +20,7 @@ use crate::utils::{escape_identifier, escape_literal};
 
 use super::state::LakehouseState;
 use super::types::{
-    AppendResponse, CancelQueryResponse, QueryLog, QueryRequest, QueryStreamHeader,
+    AppendRequest, AppendResponse, CancelQueryResponse, QueryLog, QueryRequest, QueryStreamHeader,
     ValidateRequest, ValidateResponse,
 };
 
@@ -335,35 +335,32 @@ pub async fn post_append(
     State(state): State<LakehouseState>,
     Extension(identity): Extension<Identity>,
     Query(params): Query<AppendParams>,
-    axum::Json(req): axum::Json<serde_json::Value>,
-) -> axum::Json<AppendResponse> {
-    let conn = state.get_or_create_connection(&identity).await;
-
-    let rows: Vec<serde_json::Map<String, Value>> = match req {
-        Value::Object(map) => {
-            // Single variant: {"Single": {...}} or raw object
-            if let Some(Value::Object(inner)) = map.get("Single") {
-                vec![inner.clone()]
-            } else if let Some(Value::Array(arr)) = map.get("Batch") {
-                arr.iter().filter_map(|v| v.as_object().cloned()).collect()
-            } else {
-                vec![map]
-            }
-        }
-        Value::Array(arr) => arr.into_iter().filter_map(|v| v.into_object()).collect(),
-        _ => {
-            return axum::Json(AppendResponse {
-                ok: false,
-                error_code: Some("invalid-data".to_owned()),
-            });
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let req: AppendRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(AppendResponse {
+                    ok: false,
+                    error_code: Some("invalid-data".to_owned()),
+                }),
+            );
         }
     };
 
+    let conn = state.get_or_create_connection(&identity).await;
+    let rows = req.into_vec();
+
     if rows.is_empty() {
-        return axum::Json(AppendResponse {
-            ok: true,
-            error_code: None,
-        });
+        return (
+            StatusCode::OK,
+            axum::Json(AppendResponse {
+                ok: true,
+                error_code: None,
+            }),
+        );
     }
 
     let catalog = params.catalog.clone();
@@ -415,14 +412,20 @@ pub async fn post_append(
     .await;
 
     match result {
-        Ok(Ok(())) => axum::Json(AppendResponse {
-            ok: true,
-            error_code: None,
-        }),
-        _ => axum::Json(AppendResponse {
-            ok: false,
-            error_code: Some("invalid-data".to_owned()),
-        }),
+        Ok(Ok(())) => (
+            StatusCode::OK,
+            axum::Json(AppendResponse {
+                ok: true,
+                error_code: None,
+            }),
+        ),
+        _ => (
+            StatusCode::OK,
+            axum::Json(AppendResponse {
+                ok: false,
+                error_code: Some("invalid-data".to_owned()),
+            }),
+        ),
     }
 }
 
@@ -522,20 +525,6 @@ async fn execute_query(
     .await
     .map_err(|e| anyhow::anyhow!("Task join error: {e}"))?
 }
-
-trait IntoObject {
-    fn into_object(self) -> Option<serde_json::Map<String, Value>>;
-}
-
-impl IntoObject for Value {
-    fn into_object(self) -> Option<serde_json::Map<String, Value>> {
-        match self {
-            Self::Object(m) => Some(m),
-            _ => None,
-        }
-    }
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1016,7 +1005,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn append_invalid_body_returns_ok_false() {
+    async fn append_invalid_body_returns_400() {
         let app = make_router(make_state());
         // Send a plain string (not an object or array)
         let resp = app
@@ -1032,11 +1021,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
         let result: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(result["ok"], false);
+        assert_eq!(result["error_code"], "invalid-data");
     }
 }
