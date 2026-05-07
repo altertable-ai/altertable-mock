@@ -4,7 +4,7 @@ use arrow_flight::{
         ActionBeginTransactionRequest, ActionBeginTransactionResult, ActionCancelQueryRequest,
         ActionCancelQueryResult, ActionClosePreparedStatementRequest,
         ActionCreatePreparedStatementRequest, ActionCreatePreparedStatementResult,
-        ActionEndTransactionRequest, Any,
+        ActionEndTransactionRequest,
     },
 };
 use arrow_ipc::writer::IpcWriteOptions;
@@ -170,14 +170,9 @@ pub async fn end_transaction(
 }
 
 pub async fn set_session_options(request: Request<Action>) -> Result<SetSessionOptionsResult> {
-    let any = Any::decode(&*request.get_ref().body)
-        .map_err(|e| Status::invalid_argument(format!("Failed to decode Any: {e}")))?;
-    let cmd = any
-        .unpack::<SetSessionOptionsRequest>()
-        .map_err(|e| {
-            Status::invalid_argument(format!("Failed to unpack SetSessionOptionsRequest: {e}"))
-        })?
-        .ok_or_else(|| Status::invalid_argument("Failed to unpack SetSessionOptionsRequest"))?;
+    let cmd = SetSessionOptionsRequest::decode(&*request.get_ref().body).map_err(|e| {
+        Status::invalid_argument(format!("Failed to decode SetSessionOptionsRequest: {e}"))
+    })?;
 
     let mut errors = HashMap::new();
 

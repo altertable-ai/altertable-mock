@@ -42,7 +42,7 @@ pub struct SetSessionOptionsRequest {
 
 impl ProstMessageExt for SetSessionOptionsRequest {
     fn type_url() -> &'static str {
-        "type.googleapis.com/arrow.flight.protocol.sql.SetSessionOptionsRequest"
+        "type.googleapis.com/arrow.flight.protocol.SetSessionOptionsRequest"
     }
 
     fn as_any(&self) -> arrow_flight::sql::Any {
