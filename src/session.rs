@@ -270,7 +270,7 @@ fn duckdb_logical_type_to_string(
         LogicalTypeId::Boolean => Ok("BOOLEAN".into()),
         LogicalTypeId::Tinyint => Ok("TINYINT".into()),
         LogicalTypeId::Smallint => Ok("SMALLINT".into()),
-        LogicalTypeId::Integer => Ok("INTEGER".into()),
+        LogicalTypeId::Integer | LogicalTypeId::IntegerLiteral => Ok("INTEGER".into()),
         LogicalTypeId::Bigint => Ok("BIGINT".into()),
         LogicalTypeId::UTinyint => Ok("UTINYINT".into()),
         LogicalTypeId::USmallint => Ok("USMALLINT".into()),
@@ -283,7 +283,7 @@ fn duckdb_logical_type_to_string(
         LogicalTypeId::Time => Ok("TIME".into()),
         LogicalTypeId::Interval => Ok("INTERVAL".into()),
         LogicalTypeId::Hugeint => Ok("HUGEINT".into()),
-        LogicalTypeId::Varchar => Ok("VARCHAR".into()),
+        LogicalTypeId::Varchar | LogicalTypeId::StringLiteral => Ok("VARCHAR".into()),
         LogicalTypeId::Blob => Ok("BLOB".into()),
         LogicalTypeId::Decimal => {
             let precision = logical_type.decimal_width();
@@ -311,5 +311,22 @@ fn duckdb_logical_type_to_string(
         LogicalTypeId::Uuid => Ok("UUID".into()),
         LogicalTypeId::Union => Ok("UNION".into()),
         LogicalTypeId::TimestampTZ => Ok("TIMESTAMP WITH TIME ZONE".into()),
+        LogicalTypeId::Invalid => Err(anyhow::anyhow!("invalid DuckDB type")),
+        LogicalTypeId::Bit => Ok("BIT".into()),
+        LogicalTypeId::TimeTZ => Ok("TIMETZ".into()),
+        LogicalTypeId::UHugeint => Ok("UHUGEINT".into()),
+        LogicalTypeId::Array => {
+            let element_type = logical_type.child(0);
+            let element_str = duckdb_logical_type_to_string(&element_type)?;
+            Ok(format!("{element_str}[]").into())
+        }
+        LogicalTypeId::Any => Ok("ANY".into()),
+        LogicalTypeId::Bignum => Ok("DECIMAL".into()),
+        LogicalTypeId::SqlNull => Ok("NULL".into()),
+        LogicalTypeId::TimeNs => Ok("TIME_NS".into()),
+        _ => Err(anyhow::anyhow!(
+            "unsupported DuckDB type (id={})",
+            logical_type.raw_id()
+        )),
     }
 }
