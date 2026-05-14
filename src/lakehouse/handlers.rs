@@ -20,8 +20,9 @@ use crate::utils::{escape_identifier, escape_literal};
 
 use super::state::LakehouseState;
 use super::types::{
-    AppendRequest, AppendResponse, AutocompleteRequest, AutocompleteResponse, AutocompleteSuggestion,
-    CancelQueryResponse, QueryLog, QueryRequest, QueryStreamHeader, ValidateRequest, ValidateResponse,
+    AppendRequest, AppendResponse, AutocompleteRequest, AutocompleteResponse,
+    AutocompleteSuggestion, CancelQueryResponse, QueryLog, QueryRequest, QueryStreamHeader,
+    ValidateRequest, ValidateResponse,
 };
 
 // ── /query ────────────────────────────────────────────────────────────────────
@@ -257,24 +258,21 @@ pub async fn post_autocomplete(
             limit_i64
         );
 
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut stmt = conn.prepare(&sql).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        stmt
-            .query_map(duckdb::params![], |row| {
-                let start: i32 = row.get(1)?;
-                Ok(AutocompleteSuggestion {
-                    suggestion: row.get(0)?,
-                    suggestion_start: start,
-                    suggestion_type: String::new(),
-                    suggestion_score: 0,
-                    extra_char: None,
-                })
+        stmt.query_map(duckdb::params![], |row| {
+            let start: i32 = row.get(1)?;
+            Ok(AutocompleteSuggestion {
+                suggestion: row.get(0)?,
+                suggestion_start: start,
+                suggestion_type: String::new(),
+                suggestion_score: 0,
+                extra_char: None,
             })
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| anyhow::anyhow!("{e}"))
+        })
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| anyhow::anyhow!("{e}"))
     })
     .await;
 
