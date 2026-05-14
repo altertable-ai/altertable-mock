@@ -20,7 +20,8 @@ use crate::utils::{escape_identifier, escape_literal};
 
 use super::state::LakehouseState;
 use super::types::{
-    AppendRequest, AppendResponse, CancelQueryResponse, QueryLog, QueryRequest, QueryStreamHeader,
+    AppendRequest, AppendResponse, AutocompleteRequest, AutocompleteResponse,
+    AutocompleteSuggestion, CancelQueryResponse, QueryLog, QueryRequest, QueryStreamHeader,
     ValidateRequest, ValidateResponse,
 };
 
@@ -215,6 +216,78 @@ pub async fn post_validate(
             connections_errors: HashMap::new(),
             error: Some(e.to_string()),
         }),
+    }
+}
+
+// ── /autocomplete ───────────────────────────────────────────────────────────
+
+const DEFAULT_MAX_SUGGESTIONS: u32 = 20;
+const MAX_SUGGESTIONS_CAP: u32 = 200;
+
+fn resolve_max_suggestions(max: Option<u32>) -> u32 {
+    match max {
+        None | Some(0) => DEFAULT_MAX_SUGGESTIONS,
+        Some(n) => n.min(MAX_SUGGESTIONS_CAP),
+    }
+}
+
+pub async fn post_autocomplete(
+    State(state): State<LakehouseState>,
+    Extension(identity): Extension<Identity>,
+    axum::Json(req): axum::Json<AutocompleteRequest>,
+) -> Response {
+    let statement = req.statement.trim().to_owned();
+    let statement_for_query = statement.clone();
+    let limit = resolve_max_suggestions(req.max_suggestions);
+    let limit_i64 = i64::from(limit);
+    let catalog = req.catalog.clone();
+    let schema_name = req.schema.clone();
+    let conn = state.get_or_create_connection(&identity).await;
+
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = conn
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock connection"))?;
+
+        set_catalog_schema(&conn, catalog.as_deref(), schema_name.as_deref())?;
+
+        let sql = format!(
+            "SELECT suggestion, suggestion_start FROM sql_auto_complete('{}') \
+             ORDER BY suggestion LIMIT {}",
+            escape_literal(&statement_for_query),
+            limit_i64
+        );
+
+        let mut stmt = conn.prepare(&sql).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        stmt.query_map(duckdb::params![], |row| {
+            let start: i32 = row.get(1)?;
+            Ok(AutocompleteSuggestion {
+                suggestion: row.get(0)?,
+                suggestion_start: start,
+                suggestion_type: String::new(),
+                suggestion_score: 0,
+                extra_char: None,
+            })
+        })
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| anyhow::anyhow!("{e}"))
+    })
+    .await;
+
+    match result {
+        Ok(Ok(suggestions)) => (
+            StatusCode::OK,
+            axum::Json(AutocompleteResponse {
+                suggestions,
+                statement,
+                connections_errors: HashMap::new(),
+            }),
+        )
+            .into_response(),
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     }
 }
 
@@ -565,6 +638,7 @@ mod tests {
             .route("/query/{query_id}", routing::get(get_query))
             .route("/query/{query_id}", routing::delete(delete_query))
             .route("/validate", routing::post(post_validate))
+            .route("/autocomplete", routing::post(post_autocomplete))
             .route("/upload", routing::post(post_upload))
             .route("/append", routing::post(post_append))
             .route_layer(middleware::from_fn_with_state(
@@ -922,6 +996,83 @@ mod tests {
         let result: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(result["valid"], false);
         assert!(result["error"].is_string());
+    }
+
+    // ── POST /autocomplete ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn autocomplete_requires_auth() {
+        let app = make_router(make_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/autocomplete")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"statement":"SEL"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn autocomplete_includes_select_for_sel() {
+        let app = make_router(make_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/autocomplete")
+                    .header(header::AUTHORIZATION, basic_auth_header())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"statement":"SEL","max_suggestions":50}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let result: Value = serde_json::from_slice(&bytes).unwrap();
+        let suggestions = result["suggestions"].as_array().unwrap();
+        assert!(
+            suggestions.iter().any(|s| {
+                s["suggestion"]
+                    .as_str()
+                    .is_some_and(|t| t.trim() == "SELECT")
+            }),
+            "expected SELECT among suggestions: {suggestions:?}"
+        );
+        assert_eq!(result["statement"], "SEL");
+    }
+
+    #[tokio::test]
+    async fn autocomplete_respects_max_suggestions() {
+        let app = make_router(make_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/autocomplete")
+                    .header(header::AUTHORIZATION, basic_auth_header())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"statement":"SEL","max_suggestions":3}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let result: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(result["suggestions"].as_array().unwrap().len(), 3);
+        assert_eq!(result["statement"], "SEL");
     }
 
     // ── POST /upload ──────────────────────────────────────────────────────────

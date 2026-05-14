@@ -135,6 +135,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/query/{query_id}", routing::get(lh::get_query))
         .route("/query/{query_id}", routing::delete(lh::delete_query))
         .route("/validate", routing::post(lh::post_validate))
+        .route("/autocomplete", routing::post(lh::post_autocomplete))
         .route("/upload", routing::post(lh::post_upload))
         .route("/append", routing::post(lh::post_append))
         .route_layer(middleware::from_fn_with_state(

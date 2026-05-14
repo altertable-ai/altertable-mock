@@ -33,6 +33,17 @@ pub struct ValidateRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct AutocompleteRequest {
+    pub session_id: Option<String>,
+    pub catalog: Option<String>,
+    pub schema: Option<String>,
+    pub statement: String,
+    #[serde(default)]
+    pub max_suggestions: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub enum AppendRequest {
     Single(serde_json::Map<String, serde_json::Value>),
@@ -57,6 +68,23 @@ pub struct ValidateResponse {
     pub connections_errors: HashMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AutocompleteSuggestion {
+    pub suggestion: String,
+    pub suggestion_start: i32,
+    pub suggestion_type: String,
+    pub suggestion_score: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extra_char: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AutocompleteResponse {
+    pub suggestions: Vec<AutocompleteSuggestion>,
+    pub statement: String,
+    pub connections_errors: HashMap<String, String>,
 }
 
 #[derive(Debug, Serialize)]
