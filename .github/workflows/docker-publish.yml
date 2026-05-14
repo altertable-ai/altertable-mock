@@ -20,6 +20,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+      # BuildKit GHA cache (`type=gha`) writes through the Actions cache API.
+      actions: write
 
     steps:
       - name: Checkout repository
