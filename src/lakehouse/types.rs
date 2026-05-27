@@ -25,6 +25,17 @@ pub struct QueryRequest {
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
+pub struct ExplainRequest {
+    pub session_id: Option<String>,
+    pub catalog: Option<String>,
+    pub schema: Option<String>,
+    pub statement: String,
+    #[serde(default)]
+    pub include_plan: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct ValidateRequest {
     pub statement: String,
     pub session_id: Option<String>,
@@ -60,6 +71,41 @@ impl AppendRequest {
 }
 
 // --- Response types ---
+
+#[derive(Debug, Serialize)]
+pub struct ExplainResponse {
+    pub tables: Vec<TableScanEstimate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_files: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scanned_files_estimate: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scanned_bytes_estimate: Option<u64>,
+    pub statement: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan: Option<Vec<super::explain::ExplainPlan>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub connections_errors: HashMap<String, String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TableScanEstimate {
+    pub table_name: String,
+    pub estimated_rows: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filters: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_files: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scanned_files_estimate: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scanned_bytes_estimate: Option<u64>,
+}
 
 #[derive(Debug, Serialize)]
 pub struct ValidateResponse {
