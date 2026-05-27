@@ -222,7 +222,9 @@ pub async fn post_validate(
 // ── /explain ──────────────────────────────────────────────────────────────────
 
 fn sum_optional(values: impl Iterator<Item = Option<u64>>) -> Option<u64> {
-    values.collect::<Option<Vec<_>>>().map(|v| v.into_iter().sum())
+    values
+        .collect::<Option<Vec<_>>>()
+        .map(|v| v.into_iter().sum())
 }
 
 pub async fn post_explain(
@@ -266,8 +268,12 @@ pub async fn post_explain(
             axum::Json(ExplainResponse {
                 total_files: sum_optional(tables.iter().map(|t| t.total_files)),
                 total_bytes: sum_optional(tables.iter().map(|t| t.total_bytes)),
-                scanned_files_estimate: sum_optional(tables.iter().map(|t| t.scanned_files_estimate)),
-                scanned_bytes_estimate: sum_optional(tables.iter().map(|t| t.scanned_bytes_estimate)),
+                scanned_files_estimate: sum_optional(
+                    tables.iter().map(|t| t.scanned_files_estimate),
+                ),
+                scanned_bytes_estimate: sum_optional(
+                    tables.iter().map(|t| t.scanned_bytes_estimate),
+                ),
                 plan: if include_plan { Some(vec![plan]) } else { None },
                 error: None,
                 statement,
@@ -1130,10 +1136,12 @@ mod tests {
     async fn explain_table_scan_includes_estimates() {
         let state = make_state();
         {
-            let conn = state.get_or_create_connection(&Identity {
-                username: "testuser".to_owned().into(),
-                password: "testpass".to_owned().into(),
-            }).await;
+            let conn = state
+                .get_or_create_connection(&Identity {
+                    username: "testuser".to_owned().into(),
+                    password: "testpass".to_owned().into(),
+                })
+                .await;
             let conn = conn.lock().unwrap();
             conn.execute(
                 "CREATE TABLE events (id INTEGER, category VARCHAR)",
