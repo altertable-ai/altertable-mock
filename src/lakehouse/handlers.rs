@@ -21,8 +21,8 @@ use crate::utils::{escape_identifier, escape_literal};
 use super::state::LakehouseState;
 use super::types::{
     AppendRequest, AppendResponse, AutocompleteRequest, AutocompleteResponse,
-    AutocompleteSuggestion, CancelQueryResponse, QueryLog, QueryRequest, QueryStreamHeader,
-    ValidateRequest, ValidateResponse,
+    AutocompleteSuggestion, CancelQueryResponse, ExplainRequest, ExplainResponse, QueryLog,
+    QueryRequest, QueryStreamHeader, TableScanEstimate, ValidateRequest, ValidateResponse,
 };
 
 // ── /query ────────────────────────────────────────────────────────────────────
@@ -215,6 +215,93 @@ pub async fn post_validate(
             statement: req.statement,
             connections_errors: HashMap::new(),
             error: Some(e.to_string()),
+        }),
+    }
+}
+
+// ── /explain ──────────────────────────────────────────────────────────────────
+
+fn sum_optional(values: impl Iterator<Item = Option<u64>>) -> Option<u64> {
+    values
+        .collect::<Option<Vec<_>>>()
+        .map(|v| v.into_iter().sum())
+}
+
+pub async fn post_explain(
+    State(state): State<LakehouseState>,
+    Extension(identity): Extension<Identity>,
+    axum::Json(req): axum::Json<ExplainRequest>,
+) -> axum::Json<ExplainResponse> {
+    let conn = state.get_or_create_connection(&identity).await;
+    let statement = req.statement.trim().to_owned();
+    let include_plan = req.include_plan;
+    let catalog = req.catalog.clone();
+    let schema_name = req.schema.clone();
+    let statement_for_explain = statement.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = conn
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock connection"))?;
+
+        set_catalog_schema(&conn, catalog.as_deref(), schema_name.as_deref())?;
+        super::explain::explain_statement(&conn, &statement_for_explain)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(plan)) => {
+            let tables: Vec<TableScanEstimate> = plan
+                .table_scans()
+                .into_iter()
+                .map(|scan| TableScanEstimate {
+                    table_name: scan.table_name,
+                    estimated_rows: scan.estimated_rows,
+                    filters: scan.filters,
+                    total_files: None,
+                    total_bytes: None,
+                    scanned_files_estimate: None,
+                    scanned_bytes_estimate: None,
+                })
+                .collect();
+
+            axum::Json(ExplainResponse {
+                total_files: sum_optional(tables.iter().map(|t| t.total_files)),
+                total_bytes: sum_optional(tables.iter().map(|t| t.total_bytes)),
+                scanned_files_estimate: sum_optional(
+                    tables.iter().map(|t| t.scanned_files_estimate),
+                ),
+                scanned_bytes_estimate: sum_optional(
+                    tables.iter().map(|t| t.scanned_bytes_estimate),
+                ),
+                plan: if include_plan { Some(vec![plan]) } else { None },
+                error: None,
+                statement,
+                tables,
+                connections_errors: HashMap::new(),
+            })
+        }
+        Ok(Err(e)) => axum::Json(ExplainResponse {
+            tables: vec![],
+            total_files: None,
+            total_bytes: None,
+            scanned_files_estimate: None,
+            scanned_bytes_estimate: None,
+            statement,
+            plan: None,
+            error: Some(e.to_string()),
+            connections_errors: HashMap::new(),
+        }),
+        Err(e) => axum::Json(ExplainResponse {
+            tables: vec![],
+            total_files: None,
+            total_bytes: None,
+            scanned_files_estimate: None,
+            scanned_bytes_estimate: None,
+            statement,
+            plan: None,
+            error: Some(e.to_string()),
+            connections_errors: HashMap::new(),
         }),
     }
 }
@@ -638,6 +725,7 @@ mod tests {
             .route("/query/{query_id}", routing::get(get_query))
             .route("/query/{query_id}", routing::delete(delete_query))
             .route("/validate", routing::post(post_validate))
+            .route("/explain", routing::post(post_explain))
             .route("/autocomplete", routing::post(post_autocomplete))
             .route("/upload", routing::post(post_upload))
             .route("/append", routing::post(post_append))
@@ -996,6 +1084,160 @@ mod tests {
         let result: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(result["valid"], false);
         assert!(result["error"].is_string());
+    }
+
+    // ── POST /explain ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn explain_requires_auth() {
+        let app = make_router(make_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/explain")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"statement":"SELECT 1"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn explain_simple_select_has_no_table_scans() {
+        let app = make_router(make_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/explain")
+                    .header(header::AUTHORIZATION, basic_auth_header())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"statement":"SELECT 1"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let result: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(result.get("error").is_none() || result["error"].is_null());
+        assert_eq!(result["tables"], serde_json::json!([]));
+        assert_eq!(result["statement"], "SELECT 1");
+        assert_eq!(result["connections_errors"], serde_json::json!({}));
+    }
+
+    #[tokio::test]
+    async fn explain_table_scan_includes_estimates() {
+        let state = make_state();
+        {
+            let conn = state
+                .get_or_create_connection(&Identity {
+                    username: "testuser".to_owned().into(),
+                    password: "testpass".to_owned().into(),
+                })
+                .await;
+            let conn = conn.lock().unwrap();
+            conn.execute(
+                "CREATE TABLE events (id INTEGER, category VARCHAR)",
+                duckdb::params![],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO events SELECT i, CASE WHEN i % 2 = 0 THEN 'even' ELSE 'odd' END FROM generate_series(1, 100) t(i)",
+                duckdb::params![],
+            )
+            .unwrap();
+        }
+
+        let resp = make_router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/explain")
+                    .header(header::AUTHORIZATION, basic_auth_header())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"statement":"SELECT * FROM events WHERE id > 50"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let result: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(result.get("error").is_none() || result["error"].is_null());
+        assert_eq!(result["tables"].as_array().unwrap().len(), 1);
+        assert!(
+            result["tables"][0]["table_name"]
+                .as_str()
+                .is_some_and(|name| name.ends_with("events"))
+        );
+        assert_eq!(result["tables"][0]["filters"], "id>50");
+        assert!(result["tables"][0]["estimated_rows"].as_u64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn explain_invalid_sql_returns_error_in_body() {
+        let app = make_router(make_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/explain")
+                    .header(header::AUTHORIZATION, basic_auth_header())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"statement":"NOT VALID SQL !!!"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let result: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(result["error"].is_string());
+        assert_eq!(result["tables"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn explain_include_plan_returns_plan() {
+        let app = make_router(make_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/explain")
+                    .header(header::AUTHORIZATION, basic_auth_header())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"statement":"SELECT 1","include_plan":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let result: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(result.get("error").is_none() || result["error"].is_null());
+        assert!(result["plan"].is_array());
+        assert_eq!(result["plan"].as_array().unwrap().len(), 1);
+        assert!(result["plan"][0]["name"].is_string());
     }
 
     // ── POST /autocomplete ───────────────────────────────────────────────────
