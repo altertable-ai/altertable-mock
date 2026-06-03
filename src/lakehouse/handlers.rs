@@ -5,7 +5,7 @@ use axum::{
     Extension,
     body::Body,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode, header::CONTENT_TYPE},
     response::{IntoResponse, Response},
 };
 use chrono::Utc;
@@ -378,43 +378,100 @@ pub async fn post_autocomplete(
     }
 }
 
-// ── /upload ───────────────────────────────────────────────────────────────────
+// ── /upsert ───────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Default, Deserialize, PartialEq, Copy, Clone)]
+#[serde(rename_all = "lowercase")]
+pub enum UpsertMode {
+    Create,
+    Append,
+    #[default]
+    Upsert,
+    Overwrite,
+}
 
 #[derive(Deserialize)]
-pub struct UploadParams {
+pub struct UpsertParams {
     pub catalog: String,
     pub schema: String,
     pub table: String,
-    pub format: String,
-    pub mode: String,
+    #[serde(default)]
+    pub mode: UpsertMode,
     pub primary_key: Option<String>,
 }
 
-pub async fn post_upload(
+pub async fn post_upsert(
     State(state): State<LakehouseState>,
     Extension(identity): Extension<Identity>,
-    Query(params): Query<UploadParams>,
+    Query(params): Query<UpsertParams>,
+    headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
+    if params.mode == UpsertMode::Upsert && params.primary_key.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "A primary_key is required for the upsert mode",
+        )
+            .into_response();
+    }
+
     let conn = state.get_or_create_connection(&identity).await;
 
-    let result = do_upload(conn, params, body).await;
+    let result = do_upsert(conn, params, &headers, body).await;
     match result {
         Ok(()) => StatusCode::OK.into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     }
 }
 
-async fn do_upload(
+fn detect_format_from_content_type(headers: &HeaderMap) -> Option<&'static str> {
+    let ct = headers.get(CONTENT_TYPE)?.to_str().ok()?;
+    let ct = ct
+        .split(';')
+        .next()
+        .unwrap_or(ct)
+        .trim()
+        .to_ascii_lowercase();
+    if ct == "application/json" || ct.ends_with("+json") {
+        Some("json")
+    } else if ct == "text/csv" || ct == "application/csv" {
+        Some("csv")
+    } else if ct == "application/parquet" {
+        Some("parquet")
+    } else {
+        None
+    }
+}
+
+fn detect_format_from_bytes(bytes: &[u8]) -> &'static str {
+    if bytes.len() >= 4 && bytes.starts_with(b"PAR1") {
+        "parquet"
+    } else if bytes
+        .iter()
+        .find(|b| !b.is_ascii_whitespace())
+        .is_some_and(|b| *b == b'{' || *b == b'[')
+    {
+        "json"
+    } else {
+        "csv"
+    }
+}
+
+fn detect_data_format(headers: &HeaderMap, body: &[u8]) -> &'static str {
+    detect_format_from_content_type(headers).unwrap_or_else(|| detect_format_from_bytes(body))
+}
+
+async fn do_upsert(
     conn: Arc<Mutex<Connection>>,
-    params: UploadParams,
+    params: UpsertParams,
+    headers: &HeaderMap,
     body: axum::body::Bytes,
 ) -> anyhow::Result<()> {
     let catalog = params.catalog.clone();
     let schema = params.schema.clone();
     let table = params.table.clone();
-    let format = params.format.to_lowercase();
-    let mode = params.mode.to_lowercase();
+    let format = detect_data_format(headers, &body);
+    let mode = params.mode;
     let primary_key = params.primary_key.clone();
 
     tokio::task::spawn_blocking(move || {
@@ -431,49 +488,44 @@ async fn do_upload(
             escape_identifier(&table)
         );
 
-        // Write body to a temp file so DuckDB can read it
-        let ext = match format.as_str() {
-            "csv" => "csv",
-            "json" => "json",
-            "parquet" => "parquet",
-            _ => return Err(anyhow::anyhow!("Unsupported format: {format}")),
-        };
-
-        let tmp_path = std::env::temp_dir().join(format!("altertable_upload_{}.{}", Uuid::new_v4(), ext));
+        let tmp_path = std::env::temp_dir().join(format!(
+            "altertable_upsert_{}.{}",
+            Uuid::new_v4(),
+            format
+        ));
         std::fs::write(&tmp_path, &body)?;
         let tmp_path_str = tmp_path.to_string_lossy().to_string();
 
-        let read_expr = match format.as_str() {
+        let read_expr = match format {
             "csv" => format!("read_csv('{tmp_path_str}', auto_detect=true)"),
             "json" => format!("read_json_auto('{tmp_path_str}')"),
             "parquet" => format!("read_parquet('{tmp_path_str}')"),
             _ => unreachable!(),
         };
 
-        let query = match mode.as_str() {
-            "create" => {
+        let query = match mode {
+            UpsertMode::Create => {
                 format!("CREATE TABLE {full_table} AS SELECT * FROM {read_expr}")
             }
-            "append" => {
+            UpsertMode::Append => {
                 format!("INSERT INTO {full_table} SELECT * FROM {read_expr}")
             }
-            "overwrite" => {
+            UpsertMode::Overwrite => {
                 format!(
                     "DROP TABLE IF EXISTS {full_table}; CREATE TABLE {full_table} AS SELECT * FROM {read_expr}"
                 )
             }
-            "upsert" => {
+            UpsertMode::Upsert => {
                 let pk = primary_key
-                    .ok_or_else(|| anyhow::anyhow!("primary_key required for upsert mode"))?;
+                    .expect("primary_key checked before do_upsert");
                 format!(
                     "INSERT INTO {full_table} SELECT * FROM {read_expr} ON CONFLICT ({pk}) DO UPDATE SET *"
                 )
             }
-            _ => return Err(anyhow::anyhow!("Unsupported mode: {mode}")),
         };
 
         conn.execute_batch(&query)
-            .map_err(|e| anyhow::anyhow!("Failed to execute upload: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("Failed to execute upsert: {e}"))?;
 
         let _ = std::fs::remove_file(&tmp_path);
         Ok(())
@@ -727,7 +779,7 @@ mod tests {
             .route("/validate", routing::post(post_validate))
             .route("/explain", routing::post(post_explain))
             .route("/autocomplete", routing::post(post_autocomplete))
-            .route("/upload", routing::post(post_upload))
+            .route("/upsert", routing::post(post_upsert))
             .route("/append", routing::post(post_append))
             .route_layer(middleware::from_fn_with_state(
                 state.clone(),
@@ -1317,18 +1369,19 @@ mod tests {
         assert_eq!(result["statement"], "SEL");
     }
 
-    // ── POST /upload ──────────────────────────────────────────────────────────
+    // ── POST /upsert ──────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn upload_csv_create_mode() {
+    async fn upsert_csv_create_mode() {
         let csv = "id,name\n1,Alice\n2,Bob\n";
         let app = make_router(make_state());
         let resp = app
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri("/upload?catalog=memory&schema=main&table=people&format=csv&mode=create")
+                    .uri("/upsert?catalog=memory&schema=main&table=people&mode=create")
                     .header(header::AUTHORIZATION, basic_auth_header())
+                    .header(header::CONTENT_TYPE, "text/csv")
                     .body(Body::from(csv))
                     .unwrap(),
             )
@@ -1338,15 +1391,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upload_unsupported_format_returns_400() {
+    async fn upsert_bad_parquet_returns_400() {
         let app = make_router(make_state());
         let resp = app
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri("/upload?catalog=memory&schema=main&table=t&format=xml&mode=create")
+                    .uri("/upsert?catalog=memory&schema=main&table=t&mode=create")
                     .header(header::AUTHORIZATION, basic_auth_header())
-                    .body(Body::from("data"))
+                    .header(header::CONTENT_TYPE, "application/parquet")
+                    .body(Body::from("not parquet"))
                     .unwrap(),
             )
             .await
@@ -1361,13 +1415,14 @@ mod tests {
         let state = make_state();
         let csv = "id,name\n1,Alice\n";
 
-        // First create the table via upload
+        // First create the table via upsert
         make_router(state.clone())
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri("/upload?catalog=memory&schema=main&table=append_test&format=csv&mode=create")
+                    .uri("/upsert?catalog=memory&schema=main&table=append_test&mode=create")
                     .header(header::AUTHORIZATION, basic_auth_header())
+                    .header(header::CONTENT_TYPE, "text/csv")
                     .body(Body::from(csv))
                     .unwrap(),
             )
