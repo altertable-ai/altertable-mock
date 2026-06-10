@@ -168,7 +168,15 @@ pub struct QueryLog {
 pub struct QueryStreamHeader {
     pub statement: String,
     pub rows_limit: Option<u64>,
+    pub rows_offset: Option<u64>,
+    pub init_time_ms: u32,
     pub connections_errors: HashMap<String, String>,
     pub session_id: String,
     pub query_id: Uuid,
+    pub worker_slug: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct QueryStreamError {
+    pub error: String,
 }

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use axum::{
     Extension,
@@ -22,8 +23,11 @@ use super::state::LakehouseState;
 use super::types::{
     AppendRequest, AppendResponse, AutocompleteRequest, AutocompleteResponse,
     AutocompleteSuggestion, CancelQueryResponse, ExplainRequest, ExplainResponse, QueryLog,
-    QueryRequest, QueryStreamHeader, TableScanEstimate, ValidateRequest, ValidateResponse,
+    QueryRequest, QueryStreamError, QueryStreamHeader, TableScanEstimate, ValidateRequest,
+    ValidateResponse,
 };
+
+const MOCK_WORKER_SLUG: &str = "altertable-mock";
 
 // ── /query ────────────────────────────────────────────────────────────────────
 
@@ -53,6 +57,7 @@ pub async fn post_query(
     let requested_by = req.requested_by.clone();
 
     let start_time = Utc::now();
+    let request_start = Instant::now();
 
     let mut log = QueryLog {
         uuid: query_id,
@@ -90,23 +95,37 @@ pub async fn post_query(
         .await
         .insert(query_id, log.clone());
 
+    let init_time_ms = std::cmp::max(1, request_start.elapsed().as_millis() as u32);
+    let metadata = build_query_metadata(
+        statement.clone(),
+        limit,
+        offset,
+        init_time_ms,
+        session_id.clone(),
+        query_id,
+    );
+
     match result {
         Err(e) => {
             let mut log = log.clone();
             log.error = Some(e.to_string());
             state.query_store.write().await.insert(query_id, log);
-            (StatusCode::BAD_REQUEST, e.to_string()).into_response()
+
+            let mut body = serde_json::to_string(&metadata).unwrap();
+            body.push('\n');
+            body.push_str(
+                &serde_json::to_string(&QueryStreamError {
+                    error: e.to_string(),
+                })
+                .unwrap(),
+            );
+            body.push('\n');
+
+            ndjson_response(body)
         }
         Ok((columns, rows)) => {
-            // Stream NDJSON: header line, column names line, then data rows
-            let header = QueryStreamHeader {
-                query_id,
-                statement: statement.clone(),
-                rows_limit: limit,
-                connections_errors: HashMap::new(),
-                session_id: session_id.clone(),
-            };
-            let mut body = serde_json::to_string(&header).unwrap();
+            // Stream NDJSON: metadata line, column names line, then data rows
+            let mut body = serde_json::to_string(&metadata).unwrap();
             body.push('\n');
 
             // Column names as JSON array
@@ -120,11 +139,7 @@ pub async fn post_query(
                 body.push('\n');
             }
 
-            Response::builder()
-                .status(StatusCode::OK)
-                .header("Content-Type", "application/x-ndjson")
-                .body(Body::from(body))
-                .unwrap()
+            ndjson_response(body)
         }
     }
 }
@@ -643,6 +658,34 @@ pub async fn post_append(
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
+fn build_query_metadata(
+    statement: String,
+    rows_limit: Option<u64>,
+    rows_offset: Option<u64>,
+    init_time_ms: u32,
+    session_id: String,
+    query_id: Uuid,
+) -> QueryStreamHeader {
+    QueryStreamHeader {
+        statement,
+        rows_limit,
+        rows_offset,
+        init_time_ms,
+        connections_errors: HashMap::new(),
+        session_id,
+        query_id,
+        worker_slug: MOCK_WORKER_SLUG.to_owned(),
+    }
+}
+
+fn ndjson_response(body: String) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/x-ndjson")
+        .body(Body::from(body))
+        .unwrap()
+}
+
 fn set_catalog_schema(
     conn: &Connection,
     catalog: Option<&str>,
@@ -859,6 +902,11 @@ mod tests {
         assert!(lines.len() >= 3, "expected at least 3 NDJSON lines");
         let header: Value = serde_json::from_str(lines[0]).unwrap();
         assert_eq!(header["statement"], "SELECT 42 AS n");
+        assert!(header["init_time_ms"].as_u64().is_some_and(|ms| ms > 0));
+        assert_eq!(header["rows_limit"], Value::Null);
+        assert_eq!(header["rows_offset"], Value::Null);
+        assert_eq!(header["connections_errors"], serde_json::json!({}));
+        assert_eq!(header["worker_slug"], "altertable-mock");
         let cols: Value = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(cols[0], "n");
         let row: Value = serde_json::from_str(lines[2]).unwrap();
@@ -898,7 +946,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_query_invalid_sql_returns_400() {
+    async fn post_query_invalid_sql_returns_ndjson_error() {
         let app = make_router(make_state());
         let resp = app
             .oneshot(
@@ -912,7 +960,27 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/x-ndjson"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        let lines: Vec<&str> = text.trim_end_matches('\n').split('\n').collect();
+        assert_eq!(lines.len(), 2, "expected metadata + error lines");
+
+        let metadata: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(metadata["statement"], "SELECT FROM WHERE");
+        assert!(metadata["init_time_ms"].as_u64().is_some_and(|ms| ms > 0));
+        assert_eq!(metadata["worker_slug"], "altertable-mock");
+
+        let error: Value = serde_json::from_str(lines[1]).unwrap();
+        assert!(error["error"].is_string());
     }
 
     // ── GET /query/{query_id} ─────────────────────────────────────────────────
