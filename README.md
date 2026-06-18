@@ -11,7 +11,7 @@ A mock server that implements the full [Altertable](https://altertable.ai) API s
 Altertable exposes three interfaces:
 
 - **Arrow Flight SQL** (gRPC) — high-performance query and data ingestion protocol
-- **Lakehouse REST** (HTTP) — async SQL queries, validation, and data upsert/append
+- **Lakehouse REST** (HTTP) — async SQL queries, validation, and data upload/upsert/append
 - **Product Analytics REST** (HTTP) — event tracking and user identity management
 
 This server speaks all three protocols and behaves similarly to the real service, without requiring a real Altertable account or any external infrastructure.
@@ -119,7 +119,8 @@ Authenticate with HTTP Basic Auth. All endpoints are on `localhost:15000`.
 | `GET`    | `/query/{query_id}` | Poll / fetch results for a query |
 | `DELETE` | `/query/{query_id}` | Cancel a query                   |
 | `POST`   | `/validate`         | Validate a SQL statement         |
-| `POST`   | `/upsert`           | Upsert data (CSV, JSON, Parquet) |
+| `POST`   | `/upload`           | Upload data (CSV, JSON, Parquet; modes: create, append, overwrite) |
+| `POST`   | `/upsert`           | Upsert data by primary key (CSV, JSON, Parquet) |
 | `POST`   | `/append`           | Append Arrow data                |
 
 ```bash
