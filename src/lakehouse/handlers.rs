@@ -393,16 +393,24 @@ pub async fn post_autocomplete(
     }
 }
 
-// ── /upsert ───────────────────────────────────────────────────────────────────
+// ── /upload and /upsert ───────────────────────────────────────────────────────
 
 #[derive(Debug, Default, Deserialize, PartialEq, Copy, Clone)]
 #[serde(rename_all = "lowercase")]
-pub enum UpsertMode {
+pub enum UploadMode {
     Create,
-    Append,
     #[default]
-    Upsert,
+    Append,
     Overwrite,
+}
+
+#[derive(Deserialize)]
+pub struct UploadParams {
+    pub catalog: String,
+    pub schema: String,
+    pub table: String,
+    #[serde(default)]
+    pub mode: UploadMode,
 }
 
 #[derive(Deserialize)]
@@ -410,9 +418,61 @@ pub struct UpsertParams {
     pub catalog: String,
     pub schema: String,
     pub table: String,
-    #[serde(default)]
-    pub mode: UpsertMode,
-    pub primary_key: Option<String>,
+    pub primary_key: String,
+}
+
+#[derive(Debug, PartialEq, Copy, Clone)]
+enum IngestMode {
+    Create,
+    Append,
+    Overwrite,
+    Upsert,
+}
+
+impl From<UploadMode> for IngestMode {
+    fn from(mode: UploadMode) -> Self {
+        match mode {
+            UploadMode::Create => Self::Create,
+            UploadMode::Append => Self::Append,
+            UploadMode::Overwrite => Self::Overwrite,
+        }
+    }
+}
+
+struct IngestTarget {
+    catalog: String,
+    schema: String,
+    table: String,
+    mode: IngestMode,
+    primary_key: Option<String>,
+}
+
+pub async fn post_upload(
+    State(state): State<LakehouseState>,
+    Extension(identity): Extension<Identity>,
+    Query(params): Query<UploadParams>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let conn = state.get_or_create_connection(&identity).await;
+
+    let result = do_ingest(
+        conn,
+        IngestTarget {
+            catalog: params.catalog,
+            schema: params.schema,
+            table: params.table,
+            mode: params.mode.into(),
+            primary_key: None,
+        },
+        &headers,
+        body,
+    )
+    .await;
+    match result {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    }
 }
 
 pub async fn post_upsert(
@@ -422,17 +482,21 @@ pub async fn post_upsert(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    if params.mode == UpsertMode::Upsert && params.primary_key.is_none() {
-        return (
-            StatusCode::BAD_REQUEST,
-            "A primary_key is required for the upsert mode",
-        )
-            .into_response();
-    }
-
     let conn = state.get_or_create_connection(&identity).await;
 
-    let result = do_upsert(conn, params, &headers, body).await;
+    let result = do_ingest(
+        conn,
+        IngestTarget {
+            catalog: params.catalog,
+            schema: params.schema,
+            table: params.table,
+            mode: IngestMode::Upsert,
+            primary_key: Some(params.primary_key),
+        },
+        &headers,
+        body,
+    )
+    .await;
     match result {
         Ok(()) => StatusCode::OK.into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
@@ -476,18 +540,20 @@ fn detect_data_format(headers: &HeaderMap, body: &[u8]) -> &'static str {
     detect_format_from_content_type(headers).unwrap_or_else(|| detect_format_from_bytes(body))
 }
 
-async fn do_upsert(
+async fn do_ingest(
     conn: Arc<Mutex<Connection>>,
-    params: UpsertParams,
+    target: IngestTarget,
     headers: &HeaderMap,
     body: axum::body::Bytes,
 ) -> anyhow::Result<()> {
-    let catalog = params.catalog.clone();
-    let schema = params.schema.clone();
-    let table = params.table.clone();
+    let IngestTarget {
+        catalog,
+        schema,
+        table,
+        mode,
+        primary_key,
+    } = target;
     let format = detect_data_format(headers, &body);
-    let mode = params.mode;
-    let primary_key = params.primary_key.clone();
 
     tokio::task::spawn_blocking(move || {
         let conn = conn
@@ -504,7 +570,7 @@ async fn do_upsert(
         );
 
         let tmp_path = std::env::temp_dir().join(format!(
-            "altertable_upsert_{}.{}",
+            "altertable_ingest_{}.{}",
             Uuid::new_v4(),
             format
         ));
@@ -519,28 +585,28 @@ async fn do_upsert(
         };
 
         let query = match mode {
-            UpsertMode::Create => {
+            IngestMode::Create => {
                 format!("CREATE TABLE {full_table} AS SELECT * FROM {read_expr}")
             }
-            UpsertMode::Append => {
+            IngestMode::Append => {
                 format!("INSERT INTO {full_table} SELECT * FROM {read_expr}")
             }
-            UpsertMode::Overwrite => {
+            IngestMode::Overwrite => {
                 format!(
                     "DROP TABLE IF EXISTS {full_table}; CREATE TABLE {full_table} AS SELECT * FROM {read_expr}"
                 )
             }
-            UpsertMode::Upsert => {
-                let pk = primary_key
-                    .expect("primary_key checked before do_upsert");
+            IngestMode::Upsert => {
+                let pk = primary_key.expect("primary_key must be set for upsert mode");
+                let escaped_pk = escape_identifier(&pk);
                 format!(
-                    "INSERT INTO {full_table} SELECT * FROM {read_expr} ON CONFLICT ({pk}) DO UPDATE SET *"
+                    "MERGE INTO {full_table} AS target USING (SELECT * FROM {read_expr}) AS source ON target.{escaped_pk} = source.{escaped_pk} WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT BY NAME"
                 )
             }
         };
 
         conn.execute_batch(&query)
-            .map_err(|e| anyhow::anyhow!("Failed to execute upsert: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("Failed to execute ingest: {e}"))?;
 
         let _ = std::fs::remove_file(&tmp_path);
         Ok(())
@@ -822,6 +888,7 @@ mod tests {
             .route("/validate", routing::post(post_validate))
             .route("/explain", routing::post(post_explain))
             .route("/autocomplete", routing::post(post_autocomplete))
+            .route("/upload", routing::post(post_upload))
             .route("/upsert", routing::post(post_upsert))
             .route("/append", routing::post(post_append))
             .route_layer(middleware::from_fn_with_state(
@@ -1437,17 +1504,17 @@ mod tests {
         assert_eq!(result["statement"], "SEL");
     }
 
-    // ── POST /upsert ──────────────────────────────────────────────────────────
+    // ── POST /upload ──────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn upsert_csv_create_mode() {
+    async fn upload_csv_create_mode() {
         let csv = "id,name\n1,Alice\n2,Bob\n";
         let app = make_router(make_state());
         let resp = app
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri("/upsert?catalog=memory&schema=main&table=people&mode=create")
+                    .uri("/upload?catalog=memory&schema=main&table=people&mode=create")
                     .header(header::AUTHORIZATION, basic_auth_header())
                     .header(header::CONTENT_TYPE, "text/csv")
                     .body(Body::from(csv))
@@ -1459,13 +1526,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upsert_bad_parquet_returns_400() {
+    async fn upload_bad_parquet_returns_400() {
         let app = make_router(make_state());
         let resp = app
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri("/upsert?catalog=memory&schema=main&table=t&mode=create")
+                    .uri("/upload?catalog=memory&schema=main&table=t&mode=create")
                     .header(header::AUTHORIZATION, basic_auth_header())
                     .header(header::CONTENT_TYPE, "application/parquet")
                     .body(Body::from("not parquet"))
@@ -1476,6 +1543,60 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
+    // ── POST /upsert ──────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn upsert_without_primary_key_returns_400() {
+        let app = make_router(make_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/upsert?catalog=memory&schema=main&table=t")
+                    .header(header::AUTHORIZATION, basic_auth_header())
+                    .header(header::CONTENT_TYPE, "application/parquet")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn upsert_json_by_primary_key() {
+        let state = make_state();
+        let create_body = r#"[{"id":1,"value":100},{"id":2,"value":200},{"id":3,"value":300}]"#;
+        let resp = make_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/upload?catalog=memory&schema=main&table=upsert_test&mode=create")
+                    .header(header::AUTHORIZATION, basic_auth_header())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(create_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let upsert_body = r#"[{"id":2,"value":250},{"id":4,"value":400}]"#;
+        let resp = make_router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/upsert?catalog=memory&schema=main&table=upsert_test&primary_key=id")
+                    .header(header::AUTHORIZATION, basic_auth_header())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(upsert_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
     // ── POST /append ──────────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -1483,12 +1604,12 @@ mod tests {
         let state = make_state();
         let csv = "id,name\n1,Alice\n";
 
-        // First create the table via upsert
+        // First create the table via upload
         make_router(state.clone())
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri("/upsert?catalog=memory&schema=main&table=append_test&mode=create")
+                    .uri("/upload?catalog=memory&schema=main&table=append_test&mode=create")
                     .header(header::AUTHORIZATION, basic_auth_header())
                     .header(header::CONTENT_TYPE, "text/csv")
                     .body(Body::from(csv))
