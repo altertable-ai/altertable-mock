@@ -15,10 +15,13 @@ use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
 use crate::{
-    flight::handlers::messages::{
-        CloseSessionResult, SetSessionOptionsRequest, SetSessionOptionsResult,
-        SetSessionOptionsResultError, close_session_result, session_option_value,
-        set_session_options_result_error,
+    flight::{
+        handlers::messages::{
+            CloseSessionResult, SetSessionOptionsRequest, SetSessionOptionsResult,
+            SetSessionOptionsResultError, close_session_result, session_option_value,
+            set_session_options_result_error,
+        },
+        layers::session::SessionCloser,
     },
     session::{PreparedStatement, Session},
     utils::SendableString,
@@ -232,10 +235,17 @@ pub async fn set_session_options(request: Request<Action>) -> Result<SetSessionO
     Ok(SetSessionOptionsResult { errors })
 }
 
-pub async fn close_session(_request: Request<Action>) -> Result<CloseSessionResult> {
-    // Not implemented yet.
+pub async fn close_session(request: Request<Action>) -> Result<CloseSessionResult> {
+    let status = match request.extensions().get::<SessionCloser>() {
+        Some(closer) => {
+            closer.close().await;
+            close_session_result::Status::Closed
+        }
+        None => close_session_result::Status::NotCloseable,
+    };
+
     Ok(CloseSessionResult {
-        status: close_session_result::Status::Closed as i32,
+        status: status as i32,
     })
 }
 
@@ -281,5 +291,101 @@ pub async fn fallback(
                 action.r#type
             )))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use futures::StreamExt;
+    use tonic_async_interceptor::AsyncInterceptor;
+
+    use crate::flight::layers::{
+        auth::{Identity, SessionID},
+        session::{CLOSED_SESSION_MESSAGE, interceptor},
+    };
+
+    use super::*;
+
+    fn authenticated_request(session_id: &str) -> Request<()> {
+        let mut request = Request::new(());
+        request.extensions_mut().insert(Identity {
+            username: "testuser".to_owned().into(),
+            password: "testpass".to_owned().into(),
+        });
+        request
+            .extensions_mut()
+            .insert(SessionID(session_id.to_owned().into()));
+        request
+    }
+
+    async fn close_session_via_action(session_request: Request<()>) -> CloseSessionResult {
+        let (metadata, extensions, ()) = session_request.into_parts();
+        let action = Action {
+            r#type: "CloseSession".to_owned(),
+            body: Vec::new().into(),
+        };
+
+        let mut results = fallback(Request::from_parts(metadata, extensions, action))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let result = results.next().await.unwrap().unwrap();
+        CloseSessionResult::decode(&*result.body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn closed_session_id_is_rejected_on_the_next_request() {
+        let mut interceptor = interceptor();
+
+        let opened = interceptor
+            .call(authenticated_request("session-to-close"))
+            .await
+            .unwrap();
+
+        let close_result = close_session_via_action(opened).await;
+        assert_eq!(
+            close_result.status,
+            close_session_result::Status::Closed as i32
+        );
+
+        let error = interceptor
+            .call(authenticated_request("session-to-close"))
+            .await
+            .expect_err("a closed session id must not be silently recreated");
+
+        assert_eq!(error.code(), tonic::Code::Unauthenticated);
+        assert_eq!(error.message(), CLOSED_SESSION_MESSAGE);
+    }
+
+    #[tokio::test]
+    async fn closing_one_session_leaves_the_others_usable() {
+        let mut interceptor = interceptor();
+
+        let opened = interceptor
+            .call(authenticated_request("session-to-close"))
+            .await
+            .unwrap();
+        close_session_via_action(opened).await;
+
+        interceptor
+            .call(authenticated_request("untouched-session"))
+            .await
+            .expect("closing one session must not invalidate the others");
+    }
+
+    #[tokio::test]
+    async fn close_session_without_a_session_is_not_closeable() {
+        let action = Action {
+            r#type: "CloseSession".to_owned(),
+            body: Vec::new().into(),
+        };
+
+        let result = close_session(Request::new(action)).await.unwrap();
+
+        assert_eq!(
+            result.status,
+            close_session_result::Status::NotCloseable as i32
+        );
     }
 }

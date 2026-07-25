@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
 };
 
@@ -14,6 +14,8 @@ use crate::session::Session;
 
 use super::auth::{Identity, SessionID};
 
+pub const CLOSED_SESSION_MESSAGE: &str = "Session configuration not found or expired";
+
 pub fn layer() -> AsyncInterceptorLayer<
     impl AsyncInterceptor<Future = BoxFuture<'static, Result<Request<()>, Status>>> + Clone,
 > {
@@ -24,9 +26,11 @@ pub fn interceptor()
 -> impl AsyncInterceptor<Future = BoxFuture<'static, Result<Request<()>, Status>>> + Clone {
     let lakehouse_store = Arc::new(RwLock::new(HashMap::new()));
     let session_store = Arc::new(RwLock::new(HashMap::new()));
+    let closed_sessions = Arc::new(RwLock::new(HashSet::new()));
     SessionMiddleware {
         lakehouse_store,
         session_store,
+        closed_sessions,
     }
 }
 
@@ -35,11 +39,32 @@ type LakehouseStore = Arc<RwLock<HashMap<LakehouseKey, Arc<Mutex<Connection>>>>>
 
 type SessionKey = (Identity, SessionID);
 type SessionStore = Arc<RwLock<HashMap<SessionKey, Session>>>;
+type ClosedSessions = Arc<RwLock<HashSet<SessionKey>>>;
+
+#[derive(Clone)]
+pub struct SessionCloser {
+    key: SessionKey,
+    session_store: SessionStore,
+    closed_sessions: ClosedSessions,
+}
+
+impl SessionCloser {
+    pub async fn close(&self) {
+        info!(
+            "Closing session {} for user: {}",
+            self.key.1.0, self.key.0.username
+        );
+
+        self.session_store.write().await.remove(&self.key);
+        self.closed_sessions.write().await.insert(self.key.clone());
+    }
+}
 
 #[derive(Clone)]
 struct SessionMiddleware {
     lakehouse_store: LakehouseStore,
     session_store: SessionStore,
+    closed_sessions: ClosedSessions,
 }
 
 impl AsyncInterceptor for SessionMiddleware {
@@ -48,6 +73,7 @@ impl AsyncInterceptor for SessionMiddleware {
     fn call(&mut self, mut req: Request<()>) -> Self::Future {
         let lakehouse_store = self.lakehouse_store.clone();
         let session_store = self.session_store.clone();
+        let closed_sessions = self.closed_sessions.clone();
 
         Box::pin(async move {
             let identity = req
@@ -63,6 +89,10 @@ impl AsyncInterceptor for SessionMiddleware {
                 .clone();
 
             let key = (identity, session_id);
+
+            if closed_sessions.read().await.contains(&key) {
+                return Err(Status::unauthenticated(CLOSED_SESSION_MESSAGE));
+            }
 
             let session = if let Some(session) = session_store.read().await.get(&key) {
                 info!(
@@ -98,11 +128,19 @@ impl AsyncInterceptor for SessionMiddleware {
                     schema: Arc::new(RwLock::new(None)),
                 };
 
-                session_store.write().await.insert(key, session.clone());
+                session_store
+                    .write()
+                    .await
+                    .insert(key.clone(), session.clone());
                 session
             };
 
             req.extensions_mut().insert(session);
+            req.extensions_mut().insert(SessionCloser {
+                key,
+                session_store,
+                closed_sessions,
+            });
 
             Ok(req)
         })
