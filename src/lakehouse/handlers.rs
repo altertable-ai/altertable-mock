@@ -147,15 +147,16 @@ pub async fn post_query(
 
             ndjson_response(body)
         }
-        Ok((columns, batches)) => match encode_query_response(format, &metadata, &columns, &batches)
-        {
-            Ok(response) => response,
-            Err(e) => Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .header(CONTENT_TYPE, "text/plain")
-                .body(Body::from(e.to_string()))
-                .unwrap(),
-        },
+        Ok((columns, batches)) => {
+            match encode_query_response(format, &metadata, &columns, &batches) {
+                Ok(response) => response,
+                Err(e) => Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .header(CONTENT_TYPE, "text/plain")
+                    .body(Body::from(e.to_string()))
+                    .unwrap(),
+            }
+        }
     }
 }
 
@@ -199,11 +200,7 @@ fn encode_query_response(
                     columns
                         .iter()
                         .map(|name| {
-                            arrow_schema::Field::new(
-                                name,
-                                arrow_schema::DataType::Utf8,
-                                true,
-                            )
+                            arrow_schema::Field::new(name, arrow_schema::DataType::Utf8, true)
                         })
                         .collect::<Vec<_>>(),
                 ));
@@ -227,11 +224,7 @@ fn encode_query_response(
                     columns
                         .iter()
                         .map(|name| {
-                            arrow_schema::Field::new(
-                                name,
-                                arrow_schema::DataType::Utf8,
-                                true,
-                            )
+                            arrow_schema::Field::new(name, arrow_schema::DataType::Utf8, true)
                         })
                         .collect::<Vec<_>>(),
                 ))
@@ -1240,10 +1233,7 @@ mod tests {
         assert!(error["error"].is_string());
     }
 
-    async fn query_with_format(
-        statement: &str,
-        format: &str,
-    ) -> axum::http::Response<Body> {
+    async fn query_with_format(statement: &str, format: &str) -> axum::http::Response<Body> {
         let app = make_router(make_state());
         let body = serde_json::json!({
             "statement": statement,
