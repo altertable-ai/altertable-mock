@@ -26,7 +26,7 @@ uuid = { version = "1.11.0", features = ["v4", "v5", "v7", "serde"] }
 tower-http = { version = "0.6", features = ["trace", "cors"] }
 http = "1.1"
 base64 = "0.22.1"
-duckdb = { git = "https://github.com/altertable-ai/duckdb-rs", rev = "3dc963e9d80ddf6403a1114d20a0f9a3de7833d4", features = ["serde_json", "uuid", "chrono", "appender-arrow", "variant-arrow"] }
+duckdb = { git = "https://github.com/altertable-ai/duckdb-rs", rev = "3dc963e9d80ddf6403a1114d20a0f9a3de7833d4", features = ["serde_json", "uuid", "chrono", "appender-arrow"] }
 tonic-async-interceptor = "0.14.1"
 anyhow = "1.0"
 serde = { version = "1", features = ["derive"] }
