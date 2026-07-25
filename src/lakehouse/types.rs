@@ -21,6 +21,7 @@ pub struct QueryRequest {
     pub query_id: Option<String>,
     pub timezone: Option<String>,
     pub compute_size: Option<String>,
+    pub format: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
