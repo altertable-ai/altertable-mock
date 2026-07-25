@@ -66,32 +66,19 @@ jobs:
             type=sha
             type=raw,value=latest,enable={{is_default_branch}}
 
-      - name: Build and push by digest
-        id: build
+      - name: Build and push platform image
         uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=${{ github.event_name != 'pull_request' }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:build-${{ matrix.platform_slug }}
           cache-from: type=gha,scope=${{ matrix.platform }}
           cache-to: type=gha,mode=max,scope=${{ matrix.platform }},ignore-error=true
-
-      - name: Export digest
-        if: github.event_name != 'pull_request'
-        run: |
-          mkdir -p /tmp/digests
-          digest="${{ steps.build.outputs.digest }}"
-          touch "/tmp/digests/${digest#sha256:}"
-
-      - name: Upload digest
-        if: github.event_name != 'pull_request'
-        uses: actions/upload-artifact@v4
-        with:
-          name: digests-${{ matrix.platform_slug }}
-          path: /tmp/digests/*
-          if-no-files-found: error
+          provenance: false
+          sbom: false
 
   merge:
     name: Merge and push manifest
@@ -103,13 +90,6 @@ jobs:
       packages: write
 
     steps:
-      - name: Download digests
-        uses: actions/download-artifact@v4
-        with:
-          path: /tmp/digests
-          pattern: digests-*
-          merge-multiple: true
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
@@ -135,19 +115,12 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Create manifest list and push
-        working-directory: /tmp/digests
         run: |
           tag_args=""
           while IFS= read -r tag; do
             [ -n "$tag" ] && tag_args="$tag_args -t $tag"
           done <<< "${{ steps.meta.outputs.tags }}"
 
-          mapfile -t digest_hashes < <(find . -type f -printf '%f\n')
-          if [ "${#digest_hashes[@]}" -lt 2 ]; then
-            echo "Expected digest files for each platform, found ${#digest_hashes[@]}"
-            find .
-            exit 1
-          fi
-
           docker buildx imagetools create $tag_args \
-            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s\n' "${digest_hashes[@]}")
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:build-linux-amd64 \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:build-linux-arm64
