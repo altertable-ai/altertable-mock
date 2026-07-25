@@ -31,10 +31,8 @@ jobs:
       matrix:
         include:
           - platform: linux/amd64
-            platform_slug: linux-amd64
             runner: ubuntu-latest
           - platform: linux/arm64
-            platform_slug: linux-arm64
             runner: ubuntu-24.04-arm
 
     steps:
@@ -89,7 +87,7 @@ jobs:
         if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@v4
         with:
-          name: digests-${{ matrix.platform_slug }}
+          name: digests
           path: /tmp/digests/*
           if-no-files-found: error
 
@@ -107,8 +105,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: /tmp/digests
-          pattern: digests-*
-          merge-multiple: true
+          name: digests
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -142,5 +139,12 @@ jobs:
             [ -n "$tag" ] && tag_args="$tag_args -t $tag"
           done <<< "${{ steps.meta.outputs.tags }}"
 
+          mapfile -t digest_hashes < <(find . -type f -printf '%f\n')
+          if [ "${#digest_hashes[@]}" -lt 2 ]; then
+            echo "Expected digest files for each platform, found ${#digest_hashes[@]}"
+            find .
+            exit 1
+          fi
+
           docker buildx imagetools create $tag_args \
-            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s\n' *)
+            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s\n' "${digest_hashes[@]}")
