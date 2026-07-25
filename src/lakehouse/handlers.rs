@@ -19,6 +19,11 @@ use crate::flight::layers::auth::Identity;
 use crate::session::create_schema_if_not_exists;
 use crate::utils::{escape_identifier, escape_literal};
 
+use super::format::{
+    ALTERTABLE_ORIGINAL_TYPE_JSON, ALTERTABLE_ORIGINAL_TYPE_VARIANT, OutputFormat,
+    record_batch_to_csv, record_batch_to_default_rows, record_batch_to_jsonl,
+    record_batches_to_parquet,
+};
 use super::state::LakehouseState;
 use super::types::{
     AppendRequest, AppendResponse, AutocompleteRequest, AutocompleteResponse,
@@ -36,6 +41,17 @@ pub async fn post_query(
     Extension(identity): Extension<Identity>,
     axum::Json(req): axum::Json<QueryRequest>,
 ) -> Response {
+    let format = match OutputFormat::parse(req.format.as_deref()) {
+        Ok(format) => format,
+        Err(msg) => {
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header(CONTENT_TYPE, "text/plain")
+                .body(Body::from(msg))
+                .unwrap();
+        }
+    };
+
     let conn = state.get_or_create_connection(&identity).await;
     let session_id = req
         .session_id
@@ -111,6 +127,14 @@ pub async fn post_query(
             log.error = Some(e.to_string());
             state.query_store.write().await.insert(query_id, log);
 
+            if !format.is_default() {
+                return Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .header(CONTENT_TYPE, format.content_type())
+                    .body(Body::from(e.to_string()))
+                    .unwrap();
+            }
+
             let mut body = serde_json::to_string(&metadata).unwrap();
             body.push('\n');
             body.push_str(
@@ -123,23 +147,90 @@ pub async fn post_query(
 
             ndjson_response(body)
         }
-        Ok((columns, rows)) => {
-            // Stream NDJSON: metadata line, column names line, then data rows
-            let mut body = serde_json::to_string(&metadata).unwrap();
+        Ok((columns, batches)) => {
+            match encode_query_response(format, &metadata, &columns, &batches) {
+                Ok(response) => response,
+                Err(e) => Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .header(CONTENT_TYPE, "text/plain")
+                    .body(Body::from(e.to_string()))
+                    .unwrap(),
+            }
+        }
+    }
+}
+
+fn encode_query_response(
+    format: OutputFormat,
+    metadata: &QueryStreamHeader,
+    columns: &[String],
+    batches: &[duckdb::arrow::array::RecordBatch],
+) -> anyhow::Result<Response> {
+    match format {
+        OutputFormat::Default => {
+            let mut body = serde_json::to_string(metadata)?;
             body.push('\n');
 
-            // Column names as JSON array
             let col_names: Vec<Value> = columns.iter().map(|c| Value::String(c.clone())).collect();
-            body.push_str(&serde_json::to_string(&col_names).unwrap());
+            body.push_str(&serde_json::to_string(&col_names)?);
             body.push('\n');
 
-            // Data rows
-            for row in rows {
-                body.push_str(&serde_json::to_string(&row).unwrap());
-                body.push('\n');
+            for batch in batches {
+                for row in record_batch_to_default_rows(batch)? {
+                    body.push_str(&serde_json::to_string(&row)?);
+                    body.push('\n');
+                }
             }
 
-            ndjson_response(body)
+            Ok(ndjson_response(body))
+        }
+        OutputFormat::Csv => {
+            let mut body = Vec::new();
+            if let Some(first) = batches.first() {
+                body.extend(record_batch_to_csv(
+                    &duckdb::arrow::array::RecordBatch::new_empty(first.schema()),
+                    true,
+                )?);
+                for batch in batches {
+                    body.extend(record_batch_to_csv(batch, false)?);
+                }
+            } else {
+                // Empty result: still emit a header line from column names if present.
+                let schema = Arc::new(arrow_schema::Schema::new(
+                    columns
+                        .iter()
+                        .map(|name| {
+                            arrow_schema::Field::new(name, arrow_schema::DataType::Utf8, true)
+                        })
+                        .collect::<Vec<_>>(),
+                ));
+                let empty = duckdb::arrow::array::RecordBatch::new_empty(schema);
+                body.extend(record_batch_to_csv(&empty, true)?);
+            }
+            Ok(bytes_response(StatusCode::OK, format.content_type(), body))
+        }
+        OutputFormat::Jsonl => {
+            let mut body = Vec::new();
+            for batch in batches {
+                body.extend(record_batch_to_jsonl(batch)?);
+            }
+            Ok(bytes_response(StatusCode::OK, format.content_type(), body))
+        }
+        OutputFormat::Parquet => {
+            let schema = if let Some(first) = batches.first() {
+                first.schema()
+            } else {
+                Arc::new(arrow_schema::Schema::new(
+                    columns
+                        .iter()
+                        .map(|name| {
+                            arrow_schema::Field::new(name, arrow_schema::DataType::Utf8, true)
+                        })
+                        .collect::<Vec<_>>(),
+                ))
+            };
+            let body = record_batches_to_parquet(schema, batches)?;
+            Ok(bytes_response(StatusCode::OK, format.content_type(), body))
         }
     }
 }
@@ -745,9 +836,13 @@ fn build_query_metadata(
 }
 
 fn ndjson_response(body: String) -> Response {
+    bytes_response(StatusCode::OK, "application/x-ndjson", body.into_bytes())
+}
+
+fn bytes_response(status: StatusCode, content_type: &'static str, body: Vec<u8>) -> Response {
     Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/x-ndjson")
+        .status(status)
+        .header(CONTENT_TYPE, content_type)
         .body(Body::from(body))
         .unwrap()
 }
@@ -773,7 +868,7 @@ async fn execute_query(
     schema: Option<&str>,
     limit: Option<u64>,
     offset: Option<u64>,
-) -> anyhow::Result<(Vec<String>, Vec<Vec<Value>>)> {
+) -> anyhow::Result<(Vec<String>, Vec<duckdb::arrow::array::RecordBatch>)> {
     let statement = statement.to_owned();
     let catalog = catalog.map(str::to_owned);
     let schema = schema.map(str::to_owned);
@@ -794,6 +889,15 @@ async fn execute_query(
             sql = format!("SELECT * FROM ({sql}){limit_clause}{offset_clause}");
         }
 
+        // Materialize JSON/VARIANT as JSON Utf8 (VARIANT otherwise arrives as binary struct).
+        let column_types = describe_column_types(&conn, &sql).unwrap_or_default();
+        let json_columns: std::collections::HashSet<String> = column_types
+            .iter()
+            .filter(|(_, ty)| is_json_or_variant_type(ty))
+            .map(|(name, _)| name.clone())
+            .collect();
+        let sql = wrap_json_variant_casts(&sql, &column_types);
+
         let mut stmt = conn
             .prepare(&sql)
             .map_err(|e| anyhow::anyhow!("Failed to prepare statement: {e}"))?;
@@ -804,47 +908,126 @@ async fn execute_query(
             .map_err(|e| anyhow::anyhow!("Failed to execute query: {e}"))?
             .collect();
 
-        if arrow_batches.is_empty() {
-            return Ok((vec![], vec![]));
-        }
+        // Annotate JSON Utf8 fields so default/jsonl encoding parses them as JSON objects.
+        let arrow_batches = annotate_json_utf8_fields(arrow_batches, &json_columns);
 
-        let schema_ref = arrow_batches[0].schema();
-        let columns: Vec<String> = schema_ref
-            .fields()
-            .iter()
-            .map(|f| f.name().clone())
-            .collect();
+        let columns = if let Some(first) = arrow_batches.first() {
+            first
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect()
+        } else {
+            vec![]
+        };
 
-        let mut buf = Vec::new();
-        let mut writer = arrow_json::WriterBuilder::new()
-            .with_struct_mode(arrow_json::StructMode::ListOnly)
-            .build::<_, arrow_json::writer::LineDelimited>(&mut buf);
-        for batch in &arrow_batches {
-            writer
-                .write(batch)
-                .map_err(|e| anyhow::anyhow!("Failed to serialize batch: {e}"))?;
-        }
-        writer
-            .finish()
-            .map_err(|e| anyhow::anyhow!("Failed to finish JSON writer: {e}"))?;
-
-        let rows: Vec<Vec<Value>> = buf
-            .split(|&b| b == b'\n')
-            .filter(|line| !line.is_empty())
-            .map(|line| {
-                serde_json::from_slice::<Value>(line)
-                    .map(|v| match v {
-                        Value::Array(arr) => arr,
-                        other => vec![other],
-                    })
-                    .unwrap_or_default()
-            })
-            .collect();
-
-        Ok((columns, rows))
+        Ok((columns, arrow_batches))
     })
     .await
     .map_err(|e| anyhow::anyhow!("Task join error: {e}"))?
+}
+
+fn describe_column_types(conn: &Connection, sql: &str) -> anyhow::Result<Vec<(String, String)>> {
+    let describe_sql = format!("DESCRIBE {sql}");
+    let mut stmt = conn
+        .prepare(&describe_sql)
+        .map_err(|e| anyhow::anyhow!("Failed to DESCRIBE query: {e}"))?;
+    let mut rows = stmt
+        .query([])
+        .map_err(|e| anyhow::anyhow!("Failed to run DESCRIBE: {e}"))?;
+
+    let mut columns = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| anyhow::anyhow!("Failed to read DESCRIBE row: {e}"))?
+    {
+        let name: String = row.get(0)?;
+        let type_name: String = row.get(1)?;
+        columns.push((name, type_name));
+    }
+    Ok(columns)
+}
+
+/// Cast JSON/VARIANT columns to JSON so Arrow export sees Utf8 JSON payloads (not VARIANT structs).
+fn wrap_json_variant_casts(sql: &str, column_types: &[(String, String)]) -> String {
+    if column_types.is_empty() {
+        return sql.to_owned();
+    }
+
+    let mut needs_wrap = false;
+    let mut select_list = Vec::with_capacity(column_types.len());
+    for (name, type_name) in column_types {
+        if is_json_or_variant_type(type_name) {
+            needs_wrap = true;
+            select_list.push(format!(
+                "{}::JSON AS {}",
+                escape_identifier(name),
+                escape_identifier(name)
+            ));
+        } else {
+            select_list.push(escape_identifier(name));
+        }
+    }
+
+    if !needs_wrap {
+        return sql.to_owned();
+    }
+
+    format!("SELECT {} FROM ({sql})", select_list.join(", "))
+}
+
+fn is_json_or_variant_type(type_name: &str) -> bool {
+    let ty = type_name.to_ascii_uppercase();
+    ty == ALTERTABLE_ORIGINAL_TYPE_JSON || ty == ALTERTABLE_ORIGINAL_TYPE_VARIANT
+}
+
+/// Mark known JSON/VARIANT Utf8 fields with `arrow.json` so export parses stringified JSON cells.
+fn annotate_json_utf8_fields(
+    batches: Vec<duckdb::arrow::array::RecordBatch>,
+    json_columns: &std::collections::HashSet<String>,
+) -> Vec<duckdb::arrow::array::RecordBatch> {
+    use arrow_schema::extension::{EXTENSION_TYPE_NAME_KEY, ExtensionType, Json};
+    use duckdb::arrow::datatypes::{DataType, Field, Schema};
+
+    if batches.is_empty() || json_columns.is_empty() {
+        return batches;
+    }
+
+    let schema = batches[0].schema();
+    let new_fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            if crate::lakehouse::format::field_is_json_utf8(field) {
+                return field.as_ref().clone();
+            }
+            if json_columns.contains(field.name()) && matches!(field.data_type(), DataType::Utf8) {
+                let mut metadata = field.metadata().clone();
+                metadata.insert(EXTENSION_TYPE_NAME_KEY.to_owned(), Json::NAME.to_owned());
+                return Field::new(field.name(), field.data_type().clone(), field.is_nullable())
+                    .with_metadata(metadata);
+            }
+            field.as_ref().clone()
+        })
+        .collect();
+
+    let changed = new_fields
+        .iter()
+        .zip(schema.fields().iter())
+        .any(|(new_f, old_f)| new_f.metadata() != old_f.metadata());
+    if !changed {
+        return batches;
+    }
+
+    let new_schema = Arc::new(Schema::new(new_fields));
+    batches
+        .into_iter()
+        .filter_map(|batch| {
+            duckdb::arrow::array::RecordBatch::try_new(new_schema.clone(), batch.columns().to_vec())
+                .ok()
+        })
+        .collect()
 }
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -1048,6 +1231,321 @@ mod tests {
 
         let error: Value = serde_json::from_str(lines[1]).unwrap();
         assert!(error["error"].is_string());
+    }
+
+    async fn query_with_format(statement: &str, format: &str) -> axum::http::Response<Body> {
+        let app = make_router(make_state());
+        let body = serde_json::json!({
+            "statement": statement,
+            "format": format,
+        });
+        app.oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/query")
+                .header(header::AUTHORIZATION, basic_auth_header())
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn post_query_explicit_default_format_preserves_envelope() {
+        let resp = query_with_format("SELECT 1 AS n", "default").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/x-ndjson"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert_eq!(text.lines().count(), 3);
+    }
+
+    #[tokio::test]
+    async fn post_query_unknown_format_returns_400() {
+        let resp = query_with_format("SELECT 1", "not-a-format").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains("Unsupported query format"));
+    }
+
+    #[tokio::test]
+    async fn post_query_csv_contains_only_csv_data() {
+        let app = make_router(make_state());
+        // Seed a small table, then query it as CSV.
+        let setup = r#"{"statement":"CREATE TABLE users (id INTEGER, name VARCHAR); INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob')"}"#;
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/query")
+                    .header(header::AUTHORIZATION, basic_auth_header())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(setup))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = serde_json::json!({
+            "statement": "SELECT id, name FROM users ORDER BY id",
+            "format": "csv",
+        });
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/query")
+                    .header(header::AUTHORIZATION, basic_auth_header())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/csv"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert_eq!(text, "id,name\n1,Alice\n2,Bob\n");
+    }
+
+    #[tokio::test]
+    async fn post_query_jsonl_contains_named_objects_only() {
+        let app = make_router(make_state());
+        let setup = r#"{"statement":"CREATE TABLE users_jsonl (id INTEGER, name VARCHAR); INSERT INTO users_jsonl VALUES (1, 'Alice'), (2, 'Bob')"}"#;
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/query")
+                    .header(header::AUTHORIZATION, basic_auth_header())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(setup))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = serde_json::json!({
+            "statement": "SELECT id, name FROM users_jsonl ORDER BY id",
+            "format": "jsonl",
+        });
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/query")
+                    .header(header::AUTHORIZATION, basic_auth_header())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/x-ndjson"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        let lines: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("invalid JSONL row"))
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                serde_json::json!({"id": 1, "name": "Alice"}),
+                serde_json::json!({"id": 2, "name": "Bob"}),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn post_query_parquet_contains_only_parquet_data() {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let app = make_router(make_state());
+        let setup = r#"{"statement":"CREATE TABLE users_parquet (id INTEGER, name VARCHAR); INSERT INTO users_parquet VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie')"}"#;
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/query")
+                    .header(header::AUTHORIZATION, basic_auth_header())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(setup))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = serde_json::json!({
+            "statement": "SELECT id, name FROM users_parquet ORDER BY id",
+            "format": "parquet",
+        });
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/query")
+                    .header(header::AUTHORIZATION, basic_auth_header())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/parquet"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)
+            .expect("invalid Parquet body")
+            .build()
+            .expect("failed to build Parquet reader");
+        let batches: Vec<_> = reader
+            .collect::<Result<Vec<_>, _>>()
+            .expect("failed to read Parquet batches");
+        assert_eq!(
+            batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+            3
+        );
+    }
+
+    async fn ndjson_query_succeeded(resp: axum::http::Response<Body>) -> bool {
+        if resp.status() != StatusCode::OK {
+            return false;
+        }
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        !text.lines().any(|line| {
+            serde_json::from_str::<Value>(line)
+                .ok()
+                .is_some_and(|v| v.get("error").is_some())
+        })
+    }
+
+    #[tokio::test]
+    async fn post_query_json_and_variant_cells_are_parsed_objects() {
+        let state = make_state();
+        let app = make_router(state);
+
+        let setup_variant = r#"{"statement":"CREATE TABLE json_rows (id INTEGER, payload JSON, attributes VARIANT); INSERT INTO json_rows VALUES (1, '{\"a\":1}', json('{\"b\":2}')::VARIANT), (2, '[1,2,3]', json('{\"nested\":{\"x\":true}}')::VARIANT)"}"#;
+        let setup_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/query")
+                    .header(header::AUTHORIZATION, basic_auth_header())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(setup_variant))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let (statement, expect_variant) = if ndjson_query_succeeded(setup_resp).await {
+            (
+                "SELECT id, payload, attributes FROM json_rows ORDER BY id",
+                true,
+            )
+        } else {
+            let setup_json = r#"{"statement":"CREATE TABLE json_rows (id INTEGER, payload JSON); INSERT INTO json_rows VALUES (1, '{\"a\":1}'), (2, '[1,2,3]')"}"#;
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/query")
+                        .header(header::AUTHORIZATION, basic_auth_header())
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(setup_json))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(ndjson_query_succeeded(resp).await);
+            ("SELECT id, payload FROM json_rows ORDER BY id", false)
+        };
+
+        let body = serde_json::json!({ "statement": statement });
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/query")
+                    .header(header::AUTHORIZATION, basic_auth_header())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        let lines: Vec<&str> = text.trim_end_matches('\n').split('\n').collect();
+        assert!(lines.len() >= 4);
+        let row1: Value = serde_json::from_str(lines[2]).unwrap();
+        let row2: Value = serde_json::from_str(lines[3]).unwrap();
+        assert_eq!(row1[0], 1);
+        assert_eq!(row1[1], serde_json::json!({"a": 1}));
+        assert_eq!(row2[0], 2);
+        assert_eq!(row2[1], serde_json::json!([1, 2, 3]));
+        if expect_variant {
+            assert_eq!(row1[2], serde_json::json!({"b": 2}));
+            assert_eq!(row2[2], serde_json::json!({"nested": {"x": true}}));
+        }
+    }
+
+    #[tokio::test]
+    async fn post_query_non_default_format_sql_error_has_no_ndjson_envelope() {
+        let resp = query_with_format("SELECT * FROM unknown_table", "csv").await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/csv"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(!text.contains("\"error\""));
+        assert!(!text.starts_with('{'));
     }
 
     // ── GET /query/{query_id} ─────────────────────────────────────────────────
