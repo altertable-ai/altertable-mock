@@ -703,7 +703,9 @@ fn pinned_json_columns(
 
     let mut stmt = conn.prepare(
         "SELECT column_name, data_type FROM duckdb_columns()
-         WHERE database_name = ? AND schema_name = ? AND table_name = ?
+         WHERE lower(database_name) = lower(?)
+           AND lower(schema_name) = lower(?)
+           AND lower(table_name) = lower(?)
          ORDER BY column_index",
     )?;
     let entries = stmt
@@ -1346,6 +1348,35 @@ mod tests {
             )
             .await,
             vec![serde_json::json!([0])]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn metadata_lookup_ignores_identifier_case() {
+        let state = make_state();
+        assert_eq!(
+            post_json(
+                &state,
+                "/query",
+                r#"{"statement":"CREATE TABLE memory.main.\"PinnedCase\" (id VARCHAR)"}"#,
+            )
+            .await,
+            StatusCode::OK
+        );
+
+        assert_eq!(
+            post_json(
+                &state,
+                "/upload?catalog=memory&schema=main&table=pinnedcase&mode=append",
+                r#"[{"id":"550E8400-E29B-41D4-A716-446655440000"}]"#,
+            )
+            .await,
+            StatusCode::OK
+        );
+
+        assert_eq!(
+            query_rows(&state, "SELECT id FROM memory.main.pinnedcase").await,
+            vec![serde_json::json!(["550E8400-E29B-41D4-A716-446655440000"])]
         );
     }
 
