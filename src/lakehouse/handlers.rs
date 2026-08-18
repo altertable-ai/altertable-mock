@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -662,6 +662,14 @@ fn detect_format_from_bytes(bytes: &[u8]) -> &'static str {
     }
 }
 
+fn source_column_names(conn: &Connection, read_expr: &str) -> anyhow::Result<Vec<String>> {
+    let mut stmt = conn.prepare(&format!("DESCRIBE SELECT * FROM {read_expr}"))?;
+    let names = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(names)
+}
+
 fn parse_quoted_columns(raw: &str, parameter: &str) -> anyhow::Result<Vec<String>> {
     let columns: Vec<String> = raw
         .split(',')
@@ -812,24 +820,32 @@ async fn do_ingest(
                     .map(|column| format!("target.{column} = source.{column}"))
                     .collect::<Vec<_>>()
                     .join(" AND ");
-                let source = if cursor_columns.is_empty() {
-                    format!("SELECT * FROM {read_expr}")
+                let latest_first = cursor_columns
+                    .iter()
+                    .map(|column| format!("{column} DESC NULLS LAST"))
+                    .chain(std::iter::once("__seq DESC".to_owned()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let source = format!(
+                    "SELECT * EXCLUDE (__seq) FROM (SELECT DISTINCT ON ({pk}) * FROM (SELECT *, row_number() OVER () AS __seq FROM {read_expr}) ORDER BY {pk}, {latest_first})",
+                    pk = pk_columns.join(", "),
+                );
+                let pk_lower: HashSet<String> =
+                    pk_columns.iter().map(|column| column.to_lowercase()).collect();
+                let assignments = source_column_names(&conn, &read_expr)?
+                    .iter()
+                    .map(|name| format!(r#""{}""#, escape_identifier(name)))
+                    .filter(|column| !pk_lower.contains(&column.to_lowercase()))
+                    .map(|column| format!("{column} = source.{column}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let matched = if assignments.is_empty() {
+                    String::new()
+                } else if cursor_columns.is_empty() {
+                    format!("WHEN MATCHED THEN UPDATE SET {assignments}")
                 } else {
                     format!(
-                        "SELECT DISTINCT ON ({pk}) * FROM {read_expr} ORDER BY {pk}, {cursor}",
-                        pk = pk_columns.join(", "),
-                        cursor = cursor_columns
-                            .iter()
-                            .map(|column| format!("{column} DESC NULLS LAST"))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )
-                };
-                let matched = if cursor_columns.is_empty() {
-                    "WHEN MATCHED THEN UPDATE SET *".to_owned()
-                } else {
-                    format!(
-                        "WHEN MATCHED AND ({}) THEN UPDATE SET *",
+                        "WHEN MATCHED AND ({}) THEN UPDATE SET {assignments}",
                         source_cursor_wins_condition(&cursor_columns)
                     )
                 };
@@ -1205,20 +1221,29 @@ mod tests {
         format!("Basic {encoded}")
     }
 
-    async fn post_json(state: &LakehouseState, uri: &str, body: &str) -> StatusCode {
+    async fn post_body(
+        state: &LakehouseState,
+        uri: &str,
+        content_type: &str,
+        body: &str,
+    ) -> StatusCode {
         make_router(state.clone())
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
                     .uri(uri)
                     .header(header::AUTHORIZATION, basic_auth_header())
-                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::CONTENT_TYPE, content_type)
                     .body(Body::from(body.to_owned()))
                     .unwrap(),
             )
             .await
             .unwrap()
             .status()
+    }
+
+    async fn post_json(state: &LakehouseState, uri: &str, body: &str) -> StatusCode {
+        post_body(state, uri, "application/json", body).await
     }
 
     async fn query_rows(state: &LakehouseState, statement: &str) -> Vec<Value> {
@@ -1246,6 +1271,55 @@ mod tests {
             .skip(2)
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn upsert_updates_matched_rows_by_name() {
+        let state = make_state();
+        assert_eq!(
+            post_json(
+                &state,
+                "/upload?catalog=memory&schema=main&table=by_name&mode=create",
+                r#"[{"id":1,"value":100}]"#,
+            )
+            .await,
+            StatusCode::OK
+        );
+
+        assert_eq!(
+            post_body(
+                &state,
+                "/upsert?catalog=memory&schema=main&table=by_name&primary_key=id",
+                "text/csv",
+                "value,id\n200,1",
+            )
+            .await,
+            StatusCode::OK
+        );
+
+        assert_eq!(
+            query_rows(&state, "SELECT id, value FROM memory.main.by_name").await,
+            vec![serde_json::json!([1, 200])]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn upsert_without_cursor_keeps_the_last_duplicate_row() {
+        let state = make_state();
+        assert_eq!(
+            post_json(
+                &state,
+                "/upsert?catalog=memory&schema=main&table=dedup_always&primary_key=id",
+                r#"[{"id":1,"value":1},{"id":1,"value":2}]"#,
+            )
+            .await,
+            StatusCode::OK
+        );
+
+        assert_eq!(
+            query_rows(&state, "SELECT id, value FROM memory.main.dedup_always").await,
+            vec![serde_json::json!([1, 2])]
+        );
     }
 
     fn make_router(state: LakehouseState) -> Router {
