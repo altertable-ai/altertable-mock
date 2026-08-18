@@ -722,11 +722,11 @@ async fn do_ingest(
                 format!("CREATE TABLE {full_table} AS SELECT * FROM {read_expr}")
             }
             IngestMode::Append => {
-                format!("INSERT INTO {full_table} SELECT * FROM {read_expr}")
+                format!("INSERT INTO {full_table} BY NAME SELECT * FROM {read_expr}")
             }
             IngestMode::CreateAppend => {
                 format!(
-                    "CREATE TABLE IF NOT EXISTS {full_table} AS SELECT * FROM {read_expr} LIMIT 0; INSERT INTO {full_table} SELECT * FROM {read_expr}"
+                    "CREATE TABLE IF NOT EXISTS {full_table} AS SELECT * FROM {read_expr} LIMIT 0; INSERT INTO {full_table} BY NAME SELECT * FROM {read_expr}"
                 )
             }
             IngestMode::Overwrite => {
