@@ -27,7 +27,7 @@ use crate::{
 
 const SESSION_CATALOG_KEY: &str = "catalog";
 const SESSION_SCHEMA_KEY: &str = "schema";
-const SESSION_COMPUTE_SIZE_KEY: &str = "computeSize";
+const SESSION_COMPUTE_SIZE_KEY: &str = "compute_size";
 
 type Result<T> = std::result::Result<T, Status>;
 
