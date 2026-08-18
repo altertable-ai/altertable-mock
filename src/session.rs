@@ -13,6 +13,7 @@ use duckdb::{
 use tokio::sync::RwLock;
 
 use crate::{
+    compute_size::ComputeSize,
     flight::schema_extractor::{extract_parameter_schema, extract_schema},
     utils::{SendableString, TEMP_DB, empty_params, escape_identifier, escape_literal},
 };
@@ -27,6 +28,7 @@ pub struct PreparedStatement {
 pub struct Session {
     pub catalog: Arc<RwLock<Option<String>>>,
     pub schema: Arc<RwLock<Option<String>>>,
+    pub compute_size: Arc<RwLock<ComputeSize>>,
     pub connection: Arc<Mutex<Connection>>,
     pub statements: Arc<RwLock<HashMap<Vec<u8>, PreparedStatement>>>,
 }

@@ -1,3 +1,4 @@
+mod compute_size;
 mod flight;
 mod lakehouse;
 mod product_analytics;

@@ -10,7 +10,7 @@ use tonic::{Request, Status};
 use tonic_async_interceptor::{AsyncInterceptor, AsyncInterceptorLayer, async_interceptor};
 use tracing::info;
 
-use crate::session::Session;
+use crate::{compute_size::ComputeSize, session::Session};
 
 use super::auth::{Identity, SessionID};
 
@@ -96,6 +96,7 @@ impl AsyncInterceptor for SessionMiddleware {
                     statements: Arc::new(RwLock::new(HashMap::new())),
                     catalog: Arc::new(RwLock::new(None)),
                     schema: Arc::new(RwLock::new(None)),
+                    compute_size: Arc::new(RwLock::new(ComputeSize::default())),
                 };
 
                 session_store.write().await.insert(key, session.clone());
