@@ -855,11 +855,15 @@ async fn do_ingest(
             }
         };
 
-        conn.execute_batch(&query)
-            .map_err(|e| anyhow::anyhow!("Failed to execute ingest: {e}"))?;
+        let outcome = conn
+            .execute_batch(&format!("BEGIN TRANSACTION; {query}; COMMIT;"))
+            .map_err(|e| {
+                let _ = conn.execute_batch("ROLLBACK;");
+                anyhow::anyhow!("Failed to execute ingest: {e}")
+            });
 
         let _ = std::fs::remove_file(&tmp_path);
-        Ok(())
+        outcome
     })
     .await
     .map_err(|e| anyhow::anyhow!("Task join error: {e}"))?
@@ -1319,6 +1323,29 @@ mod tests {
         assert_eq!(
             query_rows(&state, "SELECT id, value FROM memory.main.dedup_always").await,
             vec![serde_json::json!([1, 2])]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_upsert_rolls_back_the_created_table() {
+        let state = make_state();
+        assert_eq!(
+            post_json(
+                &state,
+                "/upsert?catalog=memory&schema=main&table=txn_probe&primary_key=missing",
+                r#"[{"id":1}]"#,
+            )
+            .await,
+            StatusCode::BAD_REQUEST
+        );
+
+        assert_eq!(
+            query_rows(
+                &state,
+                "SELECT count(*) FROM duckdb_tables() WHERE table_name = 'txn_probe'",
+            )
+            .await,
+            vec![serde_json::json!([0])]
         );
     }
 
