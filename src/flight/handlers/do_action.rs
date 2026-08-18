@@ -15,6 +15,7 @@ use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
 use crate::{
+    compute_size::ComputeSize,
     flight::handlers::messages::{
         CloseSessionResult, SetSessionOptionsRequest, SetSessionOptionsResult,
         SetSessionOptionsResultError, close_session_result, session_option_value,
@@ -26,6 +27,7 @@ use crate::{
 
 const SESSION_CATALOG_KEY: &str = "catalog";
 const SESSION_SCHEMA_KEY: &str = "schema";
+const SESSION_COMPUTE_SIZE_KEY: &str = "compute_size";
 
 type Result<T> = std::result::Result<T, Status>;
 
@@ -208,6 +210,40 @@ pub async fn set_session_options(request: Request<Action>) -> Result<SetSessionO
                         .ok_or_else(|| Status::internal("Missing session"))?;
 
                     session.schema.write().await.replace(schema_name);
+                } else {
+                    errors.insert(
+                        key.clone(),
+                        SetSessionOptionsResultError {
+                            value: set_session_options_result_error::ErrorValue::InvalidValue
+                                as i32,
+                        },
+                    );
+                }
+            }
+            SESSION_COMPUTE_SIZE_KEY => {
+                if let Some(session_option_value::OptionValue::String(size_str)) =
+                    value.option_value
+                {
+                    match size_str.parse::<ComputeSize>() {
+                        Ok(size) => {
+                            let session = request
+                                .extensions()
+                                .get::<Session>()
+                                .ok_or_else(|| Status::internal("Missing session"))?;
+
+                            *session.compute_size.write().await = size;
+                        }
+                        Err(_) => {
+                            errors.insert(
+                                key.clone(),
+                                SetSessionOptionsResultError {
+                                    value:
+                                        set_session_options_result_error::ErrorValue::InvalidValue
+                                            as i32,
+                                },
+                            );
+                        }
+                    }
                 } else {
                     errors.insert(
                         key.clone(),
