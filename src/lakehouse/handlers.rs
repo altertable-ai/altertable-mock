@@ -3,11 +3,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use axum::{
-    Extension,
+    Extension, Router,
     body::Body,
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, StatusCode, header::CONTENT_TYPE},
+    middleware,
     response::{IntoResponse, Response},
+    routing,
 };
 use chrono::Utc;
 use duckdb::Connection;
@@ -16,8 +18,33 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::flight::layers::auth::Identity;
+use crate::lakehouse::auth::auth_middleware;
 use crate::session::create_schema_if_not_exists;
 use crate::utils::{escape_identifier, escape_literal};
+
+pub fn router(state: super::state::LakehouseState) -> Router {
+    Router::new()
+        .route("/query", routing::post(post_query))
+        .route("/query/{query_id}", routing::get(get_query))
+        .route("/query/{query_id}", routing::delete(delete_query))
+        .route("/validate", routing::post(post_validate))
+        .route("/explain", routing::post(post_explain))
+        .route("/autocomplete", routing::post(post_autocomplete))
+        .route(
+            "/upload",
+            routing::post(post_upload).layer(DefaultBodyLimit::disable()),
+        )
+        .route(
+            "/upsert",
+            routing::post(post_upsert).layer(DefaultBodyLimit::disable()),
+        )
+        .route("/append", routing::post(post_append))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
+        .with_state(state)
+}
 
 use super::format::{
     ALTERTABLE_ORIGINAL_TYPE_JSON, ALTERTABLE_ORIGINAL_TYPE_VARIANT, OutputFormat,
@@ -1152,14 +1179,13 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::Arc;
 
+    use axum::Router;
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode, header};
-    use axum::{Router, middleware, routing};
     use base64::{Engine, prelude::BASE64_STANDARD};
     use tower::ServiceExt;
 
     use crate::flight::layers::auth::Identity;
-    use crate::lakehouse::auth::auth_middleware;
     use crate::lakehouse::state::LakehouseState;
 
     use super::*;
@@ -1223,27 +1249,7 @@ mod tests {
     }
 
     fn make_router(state: LakehouseState) -> Router {
-        Router::new()
-            .route("/query", routing::post(post_query))
-            .route("/query/{query_id}", routing::get(get_query))
-            .route("/query/{query_id}", routing::delete(delete_query))
-            .route("/validate", routing::post(post_validate))
-            .route("/explain", routing::post(post_explain))
-            .route("/autocomplete", routing::post(post_autocomplete))
-            .route(
-                "/upload",
-                routing::post(post_upload).layer(axum::extract::DefaultBodyLimit::disable()),
-            )
-            .route(
-                "/upsert",
-                routing::post(post_upsert).layer(axum::extract::DefaultBodyLimit::disable()),
-            )
-            .route("/append", routing::post(post_append))
-            .route_layer(middleware::from_fn_with_state(
-                state.clone(),
-                auth_middleware,
-            ))
-            .with_state(state)
+        super::router(state)
     }
 
     // ── auth ──────────────────────────────────────────────────────────────────
