@@ -781,6 +781,7 @@ async fn do_ingest(
         std::fs::write(&tmp_path, &body)?;
         let tmp_path_str = tmp_path.to_string_lossy().to_string();
 
+        let outcome = (|| -> anyhow::Result<()> {
         let read_expr = match format {
             "csv" => format!("read_csv('{tmp_path_str}', auto_detect=true)"),
             "json" => match pinned_json_columns(&conn, &catalog, &schema, &table, mode)? {
@@ -857,12 +858,12 @@ async fn do_ingest(
             }
         };
 
-        let outcome = conn
-            .execute_batch(&format!("BEGIN TRANSACTION; {query}; COMMIT;"))
+        conn.execute_batch(&format!("BEGIN TRANSACTION; {query}; COMMIT;"))
             .map_err(|e| {
                 let _ = conn.execute_batch("ROLLBACK;");
                 anyhow::anyhow!("Failed to execute ingest: {e}")
-            });
+            })
+        })();
 
         let _ = std::fs::remove_file(&tmp_path);
         outcome
