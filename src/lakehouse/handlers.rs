@@ -1193,8 +1193,14 @@ mod tests {
             .route("/validate", routing::post(post_validate))
             .route("/explain", routing::post(post_explain))
             .route("/autocomplete", routing::post(post_autocomplete))
-            .route("/upload", routing::post(post_upload))
-            .route("/upsert", routing::post(post_upsert))
+            .route(
+                "/upload",
+                routing::post(post_upload).layer(axum::extract::DefaultBodyLimit::disable()),
+            )
+            .route(
+                "/upsert",
+                routing::post(post_upsert).layer(axum::extract::DefaultBodyLimit::disable()),
+            )
             .route("/append", routing::post(post_append))
             .route_layer(middleware::from_fn_with_state(
                 state.clone(),
@@ -2210,6 +2216,31 @@ mod tests {
                     .header(header::AUTHORIZATION, basic_auth_header())
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(upsert_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn upload_accepts_bodies_over_the_default_extractor_limit() {
+        let state = make_state();
+        let mut csv = String::with_capacity(3_500_000);
+        csv.push_str("id\n");
+        for row in 0..400_000 {
+            csv.push_str(&format!("{row}\n"));
+        }
+        assert!(csv.len() > 2 * 1024 * 1024);
+
+        let resp = make_router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/upload?catalog=memory&schema=main&table=big_upload&mode=create")
+                    .header(header::AUTHORIZATION, basic_auth_header())
+                    .header(header::CONTENT_TYPE, "text/csv")
+                    .body(Body::from(csv))
                     .unwrap(),
             )
             .await

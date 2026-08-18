@@ -138,8 +138,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/validate", routing::post(lh::post_validate))
         .route("/explain", routing::post(lh::post_explain))
         .route("/autocomplete", routing::post(lh::post_autocomplete))
-        .route("/upload", routing::post(lh::post_upload))
-        .route("/upsert", routing::post(lh::post_upsert))
+        .route(
+            "/upload",
+            routing::post(lh::post_upload).layer(axum::extract::DefaultBodyLimit::disable()),
+        )
+        .route(
+            "/upsert",
+            routing::post(lh::post_upsert).layer(axum::extract::DefaultBodyLimit::disable()),
+        )
         .route("/append", routing::post(lh::post_append))
         .route_layer(middleware::from_fn_with_state(
             lakehouse_state.clone(),
