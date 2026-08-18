@@ -652,6 +652,40 @@ fn detect_data_format(headers: &HeaderMap, body: &[u8]) -> &'static str {
     detect_format_from_content_type(headers).unwrap_or_else(|| detect_format_from_bytes(body))
 }
 
+fn pinned_json_columns(
+    conn: &Connection,
+    catalog: &str,
+    schema: &str,
+    table: &str,
+    mode: IngestMode,
+) -> anyhow::Result<Option<String>> {
+    if !matches!(
+        mode,
+        IngestMode::Append | IngestMode::CreateAppend | IngestMode::Upsert
+    ) {
+        return Ok(None);
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT column_name, data_type FROM duckdb_columns()
+         WHERE database_name = ? AND schema_name = ? AND table_name = ?
+         ORDER BY column_index",
+    )?;
+    let entries = stmt
+        .query_map(duckdb::params![catalog, schema, table], |row| {
+            let name: String = row.get(0)?;
+            let data_type: String = row.get(1)?;
+            Ok(format!(
+                "'{}': '{}'",
+                escape_literal(&name),
+                escape_literal(&data_type)
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok((!entries.is_empty()).then(|| entries.join(", ")))
+}
+
 fn source_cursor_wins_condition(cursor_columns: &[String]) -> String {
     cursor_columns
         .iter()
@@ -712,7 +746,10 @@ async fn do_ingest(
 
         let read_expr = match format {
             "csv" => format!("read_csv('{tmp_path_str}', auto_detect=true)"),
-            "json" => format!("read_json_auto('{tmp_path_str}')"),
+            "json" => match pinned_json_columns(&conn, &catalog, &schema, &table, mode)? {
+                Some(columns) => format!("read_json('{tmp_path_str}', columns={{{columns}}})"),
+                None => format!("read_json_auto('{tmp_path_str}')"),
+            },
             "parquet" => format!("read_parquet('{tmp_path_str}')"),
             _ => unreachable!(),
         };
@@ -2586,6 +2623,72 @@ mod tests {
                 serde_json::json!([2, "us"]),
                 serde_json::json!([3, "ap"]),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn create_append_pins_json_types_to_the_existing_table() {
+        let state = make_state();
+        query_rows(
+            &state,
+            "CREATE TABLE memory.main.pinned_append (id VARCHAR, title VARCHAR)",
+        )
+        .await;
+
+        assert_eq!(
+            post_json(
+                &state,
+                "/upload?catalog=memory&schema=main&table=pinned_append&mode=create_append",
+                r#"[{"id":"550E8400-E29B-41D4-A716-446655440000","title":"First Doc"}]"#,
+            )
+            .await,
+            StatusCode::OK
+        );
+
+        let rows = query_rows(
+            &state,
+            "SELECT id, title FROM memory.main.pinned_append ORDER BY id",
+        )
+        .await;
+        assert_eq!(
+            rows,
+            vec![serde_json::json!([
+                "550E8400-E29B-41D4-A716-446655440000",
+                "First Doc"
+            ])]
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_pins_json_types_to_the_existing_table() {
+        let state = make_state();
+        query_rows(
+            &state,
+            "CREATE TABLE memory.main.pinned_upsert (id VARCHAR, title VARCHAR)",
+        )
+        .await;
+
+        assert_eq!(
+            post_json(
+                &state,
+                "/upsert?catalog=memory&schema=main&table=pinned_upsert&primary_key=id",
+                r#"[{"id":"550E8400-E29B-41D4-A716-446655440000","title":"First Doc"}]"#,
+            )
+            .await,
+            StatusCode::OK
+        );
+
+        let rows = query_rows(
+            &state,
+            "SELECT id, title FROM memory.main.pinned_upsert ORDER BY id",
+        )
+        .await;
+        assert_eq!(
+            rows,
+            vec![serde_json::json!([
+                "550E8400-E29B-41D4-A716-446655440000",
+                "First Doc"
+            ])]
         );
     }
 
