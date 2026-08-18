@@ -492,6 +492,8 @@ pub enum UploadMode {
     Create,
     #[default]
     Append,
+    #[serde(rename = "create_append")]
+    CreateAppend,
     Overwrite,
 }
 
@@ -510,12 +512,14 @@ pub struct UpsertParams {
     pub schema: String,
     pub table: String,
     pub primary_key: String,
+    pub cursor_field: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Copy, Clone)]
 enum IngestMode {
     Create,
     Append,
+    CreateAppend,
     Overwrite,
     Upsert,
 }
@@ -525,6 +529,7 @@ impl From<UploadMode> for IngestMode {
         match mode {
             UploadMode::Create => Self::Create,
             UploadMode::Append => Self::Append,
+            UploadMode::CreateAppend => Self::CreateAppend,
             UploadMode::Overwrite => Self::Overwrite,
         }
     }
@@ -536,6 +541,7 @@ struct IngestTarget {
     table: String,
     mode: IngestMode,
     primary_key: Option<String>,
+    cursor_field: Option<String>,
 }
 
 pub async fn post_upload(
@@ -555,6 +561,7 @@ pub async fn post_upload(
             table: params.table,
             mode: params.mode.into(),
             primary_key: None,
+            cursor_field: None,
         },
         &headers,
         body,
@@ -583,6 +590,7 @@ pub async fn post_upsert(
             table: params.table,
             mode: IngestMode::Upsert,
             primary_key: Some(params.primary_key),
+            cursor_field: params.cursor_field,
         },
         &headers,
         body,
@@ -627,8 +635,41 @@ fn detect_format_from_bytes(bytes: &[u8]) -> &'static str {
     }
 }
 
+fn parse_quoted_columns(raw: &str, parameter: &str) -> anyhow::Result<Vec<String>> {
+    let columns: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|column| !column.is_empty())
+        .map(|column| format!(r#""{}""#, escape_identifier(column)))
+        .collect();
+    if columns.is_empty() {
+        anyhow::bail!("{parameter} must name at least one column");
+    }
+    Ok(columns)
+}
+
 fn detect_data_format(headers: &HeaderMap, body: &[u8]) -> &'static str {
     detect_format_from_content_type(headers).unwrap_or_else(|| detect_format_from_bytes(body))
+}
+
+fn source_cursor_wins_condition(cursor_columns: &[String]) -> String {
+    cursor_columns
+        .iter()
+        .enumerate()
+        .map(|(index, column)| {
+            let mut clauses: Vec<String> = cursor_columns[..index]
+                .iter()
+                .map(|outranking| {
+                    format!("source.{outranking} IS NOT DISTINCT FROM target.{outranking}")
+                })
+                .collect();
+            clauses.push(format!(
+                "(source.{column} > target.{column} OR (source.{column} IS NOT NULL AND target.{column} IS NULL))"
+            ));
+            format!("({})", clauses.join(" AND "))
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ")
 }
 
 async fn do_ingest(
@@ -643,6 +684,7 @@ async fn do_ingest(
         table,
         mode,
         primary_key,
+        cursor_field,
     } = target;
     let format = detect_data_format(headers, &body);
 
@@ -682,16 +724,53 @@ async fn do_ingest(
             IngestMode::Append => {
                 format!("INSERT INTO {full_table} SELECT * FROM {read_expr}")
             }
+            IngestMode::CreateAppend => {
+                format!(
+                    "CREATE TABLE IF NOT EXISTS {full_table} AS SELECT * FROM {read_expr} LIMIT 0; INSERT INTO {full_table} SELECT * FROM {read_expr}"
+                )
+            }
             IngestMode::Overwrite => {
                 format!(
                     "DROP TABLE IF EXISTS {full_table}; CREATE TABLE {full_table} AS SELECT * FROM {read_expr}"
                 )
             }
             IngestMode::Upsert => {
-                let pk = primary_key.expect("primary_key must be set for upsert mode");
-                let escaped_pk = escape_identifier(&pk);
+                let raw_pk = primary_key.expect("primary_key must be set for upsert mode");
+                let pk_columns = parse_quoted_columns(&raw_pk, "primary_key")?;
+                let cursor_columns = cursor_field
+                    .as_deref()
+                    .map(|raw| parse_quoted_columns(raw, "cursor_field"))
+                    .transpose()?
+                    .unwrap_or_default();
+
+                let on_clause = pk_columns
+                    .iter()
+                    .map(|column| format!("target.{column} = source.{column}"))
+                    .collect::<Vec<_>>()
+                    .join(" AND ");
+                let source = if cursor_columns.is_empty() {
+                    format!("SELECT * FROM {read_expr}")
+                } else {
+                    format!(
+                        "SELECT DISTINCT ON ({pk}) * FROM {read_expr} ORDER BY {pk}, {cursor}",
+                        pk = pk_columns.join(", "),
+                        cursor = cursor_columns
+                            .iter()
+                            .map(|column| format!("{column} DESC NULLS LAST"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
+                let matched = if cursor_columns.is_empty() {
+                    "WHEN MATCHED THEN UPDATE SET *".to_owned()
+                } else {
+                    format!(
+                        "WHEN MATCHED AND ({}) THEN UPDATE SET *",
+                        source_cursor_wins_condition(&cursor_columns)
+                    )
+                };
                 format!(
-                    "MERGE INTO {full_table} AS target USING (SELECT * FROM {read_expr}) AS source ON target.{escaped_pk} = source.{escaped_pk} WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT BY NAME"
+                    "CREATE TABLE IF NOT EXISTS {full_table} AS SELECT * FROM {read_expr} LIMIT 0; MERGE INTO {full_table} AS target USING ({source}) AS source ON {on_clause} {matched} WHEN NOT MATCHED THEN INSERT BY NAME"
                 )
             }
         };
@@ -1061,6 +1140,49 @@ mod tests {
     fn basic_auth_header() -> String {
         let encoded = BASE64_STANDARD.encode("testuser:testpass");
         format!("Basic {encoded}")
+    }
+
+    async fn post_json(state: &LakehouseState, uri: &str, body: &str) -> StatusCode {
+        make_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(uri)
+                    .header(header::AUTHORIZATION, basic_auth_header())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_owned()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    async fn query_rows(state: &LakehouseState, statement: &str) -> Vec<Value> {
+        let resp = make_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/query")
+                    .header(header::AUTHORIZATION, basic_auth_header())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "statement": statement }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        text.trim_end_matches('\n')
+            .split('\n')
+            .skip(2)
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
     }
 
     fn make_router(state: LakehouseState) -> Router {
@@ -2093,6 +2215,347 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn upsert_creates_the_table_when_missing() {
+        let state = make_state();
+        let resp = make_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/upsert?catalog=memory&schema=main&table=fresh_upsert&primary_key=id")
+                    .header(header::AUTHORIZATION, basic_auth_header())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"[{"id":1,"value":100}]"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = make_router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/query")
+                    .header(header::AUTHORIZATION, basic_auth_header())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"statement":"SELECT count(*) FROM memory.main.fresh_upsert"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        let lines: Vec<&str> = text.trim_end_matches('\n').split('\n').collect();
+        let row: Value = serde_json::from_str(lines[2]).unwrap();
+        assert_eq!(row[0], 1);
+    }
+
+    #[tokio::test]
+    async fn upsert_composite_primary_key_with_cursor() {
+        let state = make_state();
+        let create_body = r#"[
+            {"id":1,"region":"eu","updated_at":10,"value":100},
+            {"id":2,"region":"us","updated_at":10,"value":200}
+        ]"#;
+        let resp = make_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/upload?catalog=memory&schema=main&table=cursor_test&mode=create")
+                    .header(header::AUTHORIZATION, basic_auth_header())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(create_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let stale_newer_and_new_rows = r#"[
+            {"id":1,"region":"eu","updated_at":5,"value":999},
+            {"id":2,"region":"us","updated_at":20,"value":250},
+            {"id":3,"region":"ap","updated_at":1,"value":300}
+        ]"#;
+        let resp = make_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/upsert?catalog=memory&schema=main&table=cursor_test&primary_key=id,region&cursor_field=updated_at")
+                    .header(header::AUTHORIZATION, basic_auth_header())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(stale_newer_and_new_rows))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = make_router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/query")
+                    .header(header::AUTHORIZATION, basic_auth_header())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"statement":"SELECT value FROM memory.main.cursor_test ORDER BY id"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        let lines: Vec<&str> = text.trim_end_matches('\n').split('\n').collect();
+        let values: Vec<i64> = lines[2..]
+            .iter()
+            .map(|line| {
+                serde_json::from_str::<Value>(line).unwrap()[0]
+                    .as_i64()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(values, vec![100, 250, 300]);
+    }
+
+    #[tokio::test]
+    async fn upload_create_append_creates_then_appends() {
+        let state = make_state();
+
+        for body in [r#"[{"id":1}]"#, r#"[{"id":2}]"#] {
+            let resp = make_router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/upload?catalog=memory&schema=main&table=ca_test&mode=create_append")
+                        .header(header::AUTHORIZATION, basic_auth_header())
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        let resp = make_router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/query")
+                    .header(header::AUTHORIZATION, basic_auth_header())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"statement":"SELECT count(*) FROM memory.main.ca_test"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        let lines: Vec<&str> = text.trim_end_matches('\n').split('\n').collect();
+        let row: Value = serde_json::from_str(lines[2]).unwrap();
+        assert_eq!(row[0], 2);
+    }
+
+    #[test]
+    fn parse_quoted_columns_trims_and_drops_empty_elements() {
+        assert_eq!(
+            parse_quoted_columns(" id, , region ", "primary_key").unwrap(),
+            vec![r#""id""#, r#""region""#]
+        );
+        assert!(parse_quoted_columns(" , ", "primary_key").is_err());
+    }
+
+    #[tokio::test]
+    async fn upsert_cursor_field_naming_no_column_returns_400() {
+        let state = make_state();
+        let status = post_json(
+            &state,
+            "/upsert?catalog=memory&schema=main&table=blank_cursor&primary_key=id&cursor_field=%20,%20",
+            r#"[{"id":1}]"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn upsert_null_cursor_never_wins() {
+        let state = make_state();
+        assert_eq!(
+            post_json(
+                &state,
+                "/upload?catalog=memory&schema=main&table=null_cursor&mode=create",
+                r#"[{"id":1,"updated_at":null,"value":100},{"id":9,"updated_at":5,"value":50}]"#,
+            )
+            .await,
+            StatusCode::OK
+        );
+
+        let upsert_uri = "/upsert?catalog=memory&schema=main&table=null_cursor&primary_key=id&cursor_field=updated_at";
+        assert_eq!(
+            post_json(
+                &state,
+                upsert_uri,
+                r#"[{"id":1,"updated_at":10,"value":200}]"#
+            )
+            .await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            post_json(
+                &state,
+                upsert_uri,
+                r#"[{"id":1,"updated_at":null,"value":999}]"#
+            )
+            .await,
+            StatusCode::OK
+        );
+
+        let rows = query_rows(
+            &state,
+            "SELECT id, updated_at, value FROM memory.main.null_cursor ORDER BY id",
+        )
+        .await;
+        assert_eq!(
+            rows,
+            vec![
+                serde_json::json!([1, 10, 200]),
+                serde_json::json!([9, 5, 50])
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_in_batch_dedup_ranks_null_cursor_lowest() {
+        let state = make_state();
+        assert_eq!(
+            post_json(
+                &state,
+                "/upload?catalog=memory&schema=main&table=batch_null_cursor&mode=create",
+                r#"[{"id":1,"updated_at":1,"value":100}]"#,
+            )
+            .await,
+            StatusCode::OK
+        );
+
+        assert_eq!(
+            post_json(
+                &state,
+                "/upsert?catalog=memory&schema=main&table=batch_null_cursor&primary_key=id&cursor_field=updated_at",
+                r#"[{"id":1,"updated_at":null,"value":999},{"id":1,"updated_at":5,"value":150},{"id":1,"updated_at":20,"value":200}]"#,
+            )
+            .await,
+            StatusCode::OK
+        );
+
+        let rows = query_rows(
+            &state,
+            "SELECT id, updated_at, value FROM memory.main.batch_null_cursor ORDER BY id",
+        )
+        .await;
+        assert_eq!(rows, vec![serde_json::json!([1, 20, 200])]);
+    }
+
+    #[tokio::test]
+    async fn upsert_null_leading_cursor_defers_to_the_trailing_one() {
+        let state = make_state();
+        assert_eq!(
+            post_json(
+                &state,
+                "/upload?catalog=memory&schema=main&table=composite_cursor&mode=create",
+                r#"[{"id":1,"version":null,"updated_at":1,"value":100},{"id":2,"version":null,"updated_at":5,"value":200},{"id":3,"version":1,"updated_at":1,"value":300}]"#,
+            )
+            .await,
+            StatusCode::OK
+        );
+
+        let upsert_uri = "/upsert?catalog=memory&schema=main&table=composite_cursor&primary_key=id&cursor_field=version,updated_at";
+        assert_eq!(
+            post_json(
+                &state,
+                upsert_uri,
+                r#"[{"id":1,"version":null,"updated_at":2,"value":111},{"id":2,"version":1,"updated_at":1,"value":222},{"id":3,"version":null,"updated_at":9,"value":333}]"#,
+            )
+            .await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            post_json(
+                &state,
+                upsert_uri,
+                r#"[{"id":1,"version":null,"updated_at":2,"value":999}]"#
+            )
+            .await,
+            StatusCode::OK
+        );
+
+        let rows = query_rows(
+            &state,
+            "SELECT id, version, updated_at, value FROM memory.main.composite_cursor ORDER BY id",
+        )
+        .await;
+        assert_eq!(
+            rows,
+            vec![
+                serde_json::json!([1, null, 2, 111]),
+                serde_json::json!([2, 1, 1, 222]),
+                serde_json::json!([3, 1, 1, 300]),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn key_only_upsert_inserts_new_rows_and_leaves_matched_ones() {
+        let state = make_state();
+        assert_eq!(
+            post_json(
+                &state,
+                "/upload?catalog=memory&schema=main&table=key_only&mode=create",
+                r#"[{"id":1,"region":"eu"},{"id":2,"region":"us"}]"#,
+            )
+            .await,
+            StatusCode::OK
+        );
+
+        assert_eq!(
+            post_json(
+                &state,
+                "/upsert?catalog=memory&schema=main&table=key_only&primary_key=id,region",
+                r#"[{"id":1,"region":"eu"},{"id":3,"region":"ap"}]"#,
+            )
+            .await,
+            StatusCode::OK
+        );
+
+        let rows = query_rows(
+            &state,
+            "SELECT id, region FROM memory.main.key_only ORDER BY id",
+        )
+        .await;
+        assert_eq!(
+            rows,
+            vec![
+                serde_json::json!([1, "eu"]),
+                serde_json::json!([2, "us"]),
+                serde_json::json!([3, "ap"]),
+            ]
+        );
     }
 
     // ── POST /append ──────────────────────────────────────────────────────────
