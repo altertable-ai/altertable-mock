@@ -2427,157 +2427,87 @@ mod tests {
     #[tokio::test]
     async fn upsert_creates_the_table_when_missing() {
         let state = make_state();
-        let resp = make_router(state.clone())
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/upsert?catalog=memory&schema=main&table=fresh_upsert&primary_key=id")
-                    .header(header::AUTHORIZATION, basic_auth_header())
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"[{"id":1,"value":100}]"#))
-                    .unwrap(),
+        assert_eq!(
+            post_json(
+                &state,
+                "/upsert?catalog=memory&schema=main&table=fresh_upsert&primary_key=id",
+                r#"[{"id":1,"value":100}]"#,
             )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+            .await,
+            StatusCode::OK
+        );
 
-        let resp = make_router(state)
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/query")
-                    .header(header::AUTHORIZATION, basic_auth_header())
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        r#"{"statement":"SELECT count(*) FROM memory.main.fresh_upsert"}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let text = std::str::from_utf8(&body).unwrap();
-        let lines: Vec<&str> = text.trim_end_matches('\n').split('\n').collect();
-        let row: Value = serde_json::from_str(lines[2]).unwrap();
-        assert_eq!(row[0], 1);
+        assert_eq!(
+            query_rows(&state, "SELECT count(*) FROM memory.main.fresh_upsert").await,
+            vec![serde_json::json!([1])]
+        );
     }
 
     #[tokio::test]
     async fn upsert_composite_primary_key_with_cursor() {
         let state = make_state();
-        let create_body = r#"[
+        let seeded_rows = r#"[
             {"id":1,"region":"eu","updated_at":10,"value":100},
             {"id":2,"region":"us","updated_at":10,"value":200}
         ]"#;
-        let resp = make_router(state.clone())
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/upload?catalog=memory&schema=main&table=cursor_test&mode=create")
-                    .header(header::AUTHORIZATION, basic_auth_header())
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(create_body))
-                    .unwrap(),
+        assert_eq!(
+            post_json(
+                &state,
+                "/upload?catalog=memory&schema=main&table=cursor_test&mode=create",
+                seeded_rows,
             )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+            .await,
+            StatusCode::OK
+        );
 
         let stale_newer_and_new_rows = r#"[
             {"id":1,"region":"eu","updated_at":5,"value":999},
             {"id":2,"region":"us","updated_at":20,"value":250},
             {"id":3,"region":"ap","updated_at":1,"value":300}
         ]"#;
-        let resp = make_router(state.clone())
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/upsert?catalog=memory&schema=main&table=cursor_test&primary_key=id,region&cursor_field=updated_at")
-                    .header(header::AUTHORIZATION, basic_auth_header())
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(stale_newer_and_new_rows))
-                    .unwrap(),
+        assert_eq!(
+            post_json(
+                &state,
+                "/upsert?catalog=memory&schema=main&table=cursor_test&primary_key=id,region&cursor_field=updated_at",
+                stale_newer_and_new_rows,
             )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+            .await,
+            StatusCode::OK
+        );
 
-        let resp = make_router(state)
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/query")
-                    .header(header::AUTHORIZATION, basic_auth_header())
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        r#"{"statement":"SELECT value FROM memory.main.cursor_test ORDER BY id"}"#,
-                    ))
-                    .unwrap(),
+        assert_eq!(
+            query_rows(
+                &state,
+                "SELECT value FROM memory.main.cursor_test ORDER BY id"
             )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let text = std::str::from_utf8(&body).unwrap();
-        let lines: Vec<&str> = text.trim_end_matches('\n').split('\n').collect();
-        let values: Vec<i64> = lines[2..]
-            .iter()
-            .map(|line| {
-                serde_json::from_str::<Value>(line).unwrap()[0]
-                    .as_i64()
-                    .unwrap()
-            })
-            .collect();
-        assert_eq!(values, vec![100, 250, 300]);
+            .await,
+            vec![
+                serde_json::json!([100]),
+                serde_json::json!([250]),
+                serde_json::json!([300]),
+            ]
+        );
     }
 
     #[tokio::test]
     async fn upload_create_append_creates_then_appends() {
         let state = make_state();
-
         for body in [r#"[{"id":1}]"#, r#"[{"id":2}]"#] {
-            let resp = make_router(state.clone())
-                .oneshot(
-                    Request::builder()
-                        .method(Method::POST)
-                        .uri("/upload?catalog=memory&schema=main&table=ca_test&mode=create_append")
-                        .header(header::AUTHORIZATION, basic_auth_header())
-                        .header(header::CONTENT_TYPE, "application/json")
-                        .body(Body::from(body))
-                        .unwrap(),
+            assert_eq!(
+                post_json(
+                    &state,
+                    "/upload?catalog=memory&schema=main&table=ca_test&mode=create_append",
+                    body,
                 )
-                .await
-                .unwrap();
-            assert_eq!(resp.status(), StatusCode::OK);
+                .await,
+                StatusCode::OK
+            );
         }
 
-        let resp = make_router(state)
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/query")
-                    .header(header::AUTHORIZATION, basic_auth_header())
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        r#"{"statement":"SELECT count(*) FROM memory.main.ca_test"}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let text = std::str::from_utf8(&body).unwrap();
-        let lines: Vec<&str> = text.trim_end_matches('\n').split('\n').collect();
-        let row: Value = serde_json::from_str(lines[2]).unwrap();
-        assert_eq!(row[0], 2);
+        assert_eq!(
+            query_rows(&state, "SELECT count(*) FROM memory.main.ca_test").await,
+            vec![serde_json::json!([2])]
+        );
     }
 
     #[test]
