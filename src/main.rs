@@ -16,7 +16,7 @@ use tower_http::trace::TraceLayer;
 use tracing::info;
 use tracing_subscriber::{self, EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
-use lakehouse::{auth::auth_middleware, handlers as lh, state::LakehouseState};
+use lakehouse::{handlers as lh, state::LakehouseState};
 use product_analytics::{
     auth::auth_middleware as pa_auth_middleware, handlers as pa, state::ProductAnalyticsState,
 };
@@ -131,21 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let lakehouse_addr =
         format!("0.0.0.0:{}", args.lakehouse_port).parse::<std::net::SocketAddr>()?;
 
-    let lakehouse_router = Router::new()
-        .route("/query", routing::post(lh::post_query))
-        .route("/query/{query_id}", routing::get(lh::get_query))
-        .route("/query/{query_id}", routing::delete(lh::delete_query))
-        .route("/validate", routing::post(lh::post_validate))
-        .route("/explain", routing::post(lh::post_explain))
-        .route("/autocomplete", routing::post(lh::post_autocomplete))
-        .route("/upload", routing::post(lh::post_upload))
-        .route("/upsert", routing::post(lh::post_upsert))
-        .route("/append", routing::post(lh::post_append))
-        .route_layer(middleware::from_fn_with_state(
-            lakehouse_state.clone(),
-            auth_middleware,
-        ))
-        .with_state(lakehouse_state);
+    let lakehouse_router = lh::router(lakehouse_state);
 
     let lakehouse_handle = tokio::spawn(async move {
         info!("Starting Lakehouse HTTP server on {}", lakehouse_addr);

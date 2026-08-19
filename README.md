@@ -119,8 +119,8 @@ Authenticate with HTTP Basic Auth. All endpoints are on `localhost:15000`.
 | `GET`    | `/query/{query_id}` | Poll / fetch results for a query |
 | `DELETE` | `/query/{query_id}` | Cancel a query                   |
 | `POST`   | `/validate`         | Validate a SQL statement         |
-| `POST`   | `/upload`           | Upload data (CSV, JSON, Parquet; modes: create, append, overwrite) |
-| `POST`   | `/upsert`           | Upsert data by primary key (CSV, JSON, Parquet) |
+| `POST`   | `/upload`           | Upload data (CSV, JSON, Parquet; modes: create, append, create_append, overwrite) |
+| `POST`   | `/upsert`           | Upsert data by one or more primary key columns, newest cursor_field value wins (CSV, JSON, Parquet) |
 | `POST`   | `/append`           | Append Arrow data                |
 
 ```bash
