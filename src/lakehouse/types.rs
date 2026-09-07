@@ -181,3 +181,12 @@ pub struct QueryStreamHeader {
 pub struct QueryStreamError {
     pub error: String,
 }
+
+// --- Query column schema (second NDJSON line) ---
+
+#[derive(Debug, Clone, Serialize)]
+pub struct QueryColumn {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub type_name: String,
+}

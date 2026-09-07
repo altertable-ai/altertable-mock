@@ -5,6 +5,7 @@ use arrow_array::cast::AsArray;
 use arrow_csv::WriterBuilder as CsvWriterBuilder;
 use arrow_schema::extension::{EXTENSION_TYPE_NAME_KEY, ExtensionType, Json};
 use arrow_schema::{Field, Schema, SchemaRef};
+use duckdb::core::{LogicalTypeHandle, LogicalTypeId};
 use parquet::arrow::ArrowWriter;
 use serde_json::{Map, Value};
 
@@ -59,6 +60,89 @@ pub fn field_is_json_utf8(field: &Field) -> bool {
                 let ty = ty.to_ascii_uppercase();
                 ty == ALTERTABLE_ORIGINAL_TYPE_JSON || ty == ALTERTABLE_ORIGINAL_TYPE_VARIANT
             })
+}
+
+/// Mirrors the real API's `arrow_type_to_string`, which resolves the DuckDB spelling of an Arrow
+/// field for the `columns` line of a `POST /query` response.
+pub fn arrow_type_to_string(field: &Field) -> anyhow::Result<String> {
+    if field
+        .metadata()
+        .get(ALTERTABLE_ORIGINAL_TYPE_METADATA_KEY)
+        .is_some_and(|ty| ty.eq_ignore_ascii_case(ALTERTABLE_ORIGINAL_TYPE_VARIANT))
+    {
+        return Ok(ALTERTABLE_ORIGINAL_TYPE_VARIANT.to_owned());
+    }
+
+    if field_is_json_utf8(field) {
+        return Ok(ALTERTABLE_ORIGINAL_TYPE_JSON.to_owned());
+    }
+
+    let logical_type = duckdb::vtab::to_duckdb_logical_type(field.data_type())
+        .map_err(|e| anyhow::anyhow!("failed to convert arrow type to duckdb logical type: {e}"))?;
+
+    duckdb_type_to_string(&logical_type)
+}
+
+fn duckdb_type_to_string(logical_type: &LogicalTypeHandle) -> anyhow::Result<String> {
+    let name = match logical_type.id() {
+        LogicalTypeId::Boolean => "BOOLEAN".to_owned(),
+        LogicalTypeId::Tinyint => "TINYINT".to_owned(),
+        LogicalTypeId::Smallint => "SMALLINT".to_owned(),
+        LogicalTypeId::Integer | LogicalTypeId::IntegerLiteral => "INTEGER".to_owned(),
+        LogicalTypeId::Bigint => "BIGINT".to_owned(),
+        LogicalTypeId::UTinyint => "UTINYINT".to_owned(),
+        LogicalTypeId::USmallint => "USMALLINT".to_owned(),
+        LogicalTypeId::UInteger => "UINTEGER".to_owned(),
+        LogicalTypeId::UBigint => "UBIGINT".to_owned(),
+        LogicalTypeId::Float => "FLOAT".to_owned(),
+        LogicalTypeId::Double => "DOUBLE".to_owned(),
+        LogicalTypeId::Timestamp => "TIMESTAMP".to_owned(),
+        LogicalTypeId::Date => "DATE".to_owned(),
+        LogicalTypeId::Time => "TIME".to_owned(),
+        LogicalTypeId::Interval => "INTERVAL".to_owned(),
+        LogicalTypeId::Hugeint => "HUGEINT".to_owned(),
+        LogicalTypeId::Varchar | LogicalTypeId::StringLiteral => "VARCHAR".to_owned(),
+        LogicalTypeId::Blob => "BLOB".to_owned(),
+        LogicalTypeId::Decimal => {
+            let precision = logical_type.decimal_width();
+            let scale = logical_type.decimal_scale();
+            format!("DECIMAL({precision}, {scale})")
+        }
+        LogicalTypeId::TimestampS => "TIMESTAMP_S".to_owned(),
+        LogicalTypeId::TimestampMs => "TIMESTAMP_MS".to_owned(),
+        LogicalTypeId::TimestampNs => "TIMESTAMP_NS".to_owned(),
+        LogicalTypeId::Enum => "ENUM".to_owned(),
+        LogicalTypeId::List => "LIST".to_owned(),
+        LogicalTypeId::Struct => {
+            let field_strs = (0..logical_type.num_children())
+                .map(|i| {
+                    let field_name = logical_type.child_name(i);
+                    let field_type = duckdb_type_to_string(&logical_type.child(i))?;
+                    Ok(format!("{field_name} {field_type}"))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            format!("STRUCT({})", field_strs.join(", "))
+        }
+        LogicalTypeId::Map => "MAP".to_owned(),
+        LogicalTypeId::Uuid => "UUID".to_owned(),
+        LogicalTypeId::Union => "UNION".to_owned(),
+        LogicalTypeId::TimestampTZ => "TIMESTAMP WITH TIME ZONE".to_owned(),
+        LogicalTypeId::Invalid => anyhow::bail!("invalid DuckDB type"),
+        LogicalTypeId::Bit => "BIT".to_owned(),
+        LogicalTypeId::TimeTZ => "TIMETZ".to_owned(),
+        LogicalTypeId::UHugeint => "UHUGEINT".to_owned(),
+        LogicalTypeId::Array => {
+            let element = duckdb_type_to_string(&logical_type.child(0))?;
+            format!("{element}[]")
+        }
+        LogicalTypeId::Any => "ANY".to_owned(),
+        LogicalTypeId::Bignum => "DECIMAL".to_owned(),
+        LogicalTypeId::SqlNull => "NULL".to_owned(),
+        LogicalTypeId::TimeNs => "TIME_NS".to_owned(),
+        _ => anyhow::bail!("unsupported DuckDB type (id={})", logical_type.raw_id()),
+    };
+
+    Ok(name)
 }
 
 pub fn record_batch_to_csv(batch: &RecordBatch, include_header: bool) -> anyhow::Result<Vec<u8>> {

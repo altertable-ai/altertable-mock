@@ -47,16 +47,16 @@ pub fn router(state: super::state::LakehouseState) -> Router {
 }
 
 use super::format::{
-    ALTERTABLE_ORIGINAL_TYPE_JSON, ALTERTABLE_ORIGINAL_TYPE_VARIANT, OutputFormat,
-    record_batch_to_csv, record_batch_to_default_rows, record_batch_to_jsonl,
-    record_batches_to_parquet,
+    ALTERTABLE_ORIGINAL_TYPE_JSON, ALTERTABLE_ORIGINAL_TYPE_METADATA_KEY,
+    ALTERTABLE_ORIGINAL_TYPE_VARIANT, OutputFormat, arrow_type_to_string, record_batch_to_csv,
+    record_batch_to_default_rows, record_batch_to_jsonl, record_batches_to_parquet,
 };
 use super::state::LakehouseState;
 use super::types::{
     AppendRequest, AppendResponse, AutocompleteRequest, AutocompleteResponse,
-    AutocompleteSuggestion, CancelQueryResponse, ExplainRequest, ExplainResponse, QueryLog,
-    QueryRequest, QueryStreamError, QueryStreamHeader, TableScanEstimate, ValidateRequest,
-    ValidateResponse,
+    AutocompleteSuggestion, CancelQueryResponse, ExplainRequest, ExplainResponse, QueryColumn,
+    QueryLog, QueryRequest, QueryStreamError, QueryStreamHeader, TableScanEstimate,
+    ValidateRequest, ValidateResponse,
 };
 
 const MOCK_WORKER_SLUG: &str = "altertable-mock";
@@ -190,7 +190,7 @@ pub async fn post_query(
 fn encode_query_response(
     format: OutputFormat,
     metadata: &QueryStreamHeader,
-    columns: &[String],
+    columns: &[QueryColumn],
     batches: &[duckdb::arrow::array::RecordBatch],
 ) -> anyhow::Result<Response> {
     match format {
@@ -198,8 +198,7 @@ fn encode_query_response(
             let mut body = serde_json::to_string(metadata)?;
             body.push('\n');
 
-            let col_names: Vec<Value> = columns.iter().map(|c| Value::String(c.clone())).collect();
-            body.push_str(&serde_json::to_string(&col_names)?);
+            body.push_str(&serde_json::to_string(columns)?);
             body.push('\n');
 
             for batch in batches {
@@ -226,8 +225,12 @@ fn encode_query_response(
                 let schema = Arc::new(arrow_schema::Schema::new(
                     columns
                         .iter()
-                        .map(|name| {
-                            arrow_schema::Field::new(name, arrow_schema::DataType::Utf8, true)
+                        .map(|column| {
+                            arrow_schema::Field::new(
+                                &column.name,
+                                arrow_schema::DataType::Utf8,
+                                true,
+                            )
                         })
                         .collect::<Vec<_>>(),
                 ));
@@ -250,8 +253,12 @@ fn encode_query_response(
                 Arc::new(arrow_schema::Schema::new(
                     columns
                         .iter()
-                        .map(|name| {
-                            arrow_schema::Field::new(name, arrow_schema::DataType::Utf8, true)
+                        .map(|column| {
+                            arrow_schema::Field::new(
+                                &column.name,
+                                arrow_schema::DataType::Utf8,
+                                true,
+                            )
                         })
                         .collect::<Vec<_>>(),
                 ))
@@ -1034,7 +1041,7 @@ async fn execute_query(
     schema: Option<&str>,
     limit: Option<u64>,
     offset: Option<u64>,
-) -> anyhow::Result<(Vec<String>, Vec<duckdb::arrow::array::RecordBatch>)> {
+) -> anyhow::Result<(Vec<QueryColumn>, Vec<duckdb::arrow::array::RecordBatch>)> {
     let statement = statement.to_owned();
     let catalog = catalog.map(str::to_owned);
     let schema = schema.map(str::to_owned);
@@ -1062,6 +1069,11 @@ async fn execute_query(
             .filter(|(_, ty)| is_json_or_variant_type(ty))
             .map(|(name, _)| name.clone())
             .collect();
+        let variant_columns: std::collections::HashSet<String> = column_types
+            .iter()
+            .filter(|(_, ty)| ty.eq_ignore_ascii_case(ALTERTABLE_ORIGINAL_TYPE_VARIANT))
+            .map(|(name, _)| name.clone())
+            .collect();
         let sql = wrap_json_variant_casts(&sql, &column_types);
 
         let mut stmt = conn
@@ -1069,24 +1081,30 @@ async fn execute_query(
             .map_err(|e| anyhow::anyhow!("Failed to prepare statement: {e}"))?;
 
         // Use query_arrow which executes the statement and gives schema + data
-        let arrow_batches: Vec<duckdb::arrow::array::RecordBatch> = stmt
+        let arrow = stmt
             .query_arrow(duckdb::params![])
-            .map_err(|e| anyhow::anyhow!("Failed to execute query: {e}"))?
-            .collect();
+            .map_err(|e| anyhow::anyhow!("Failed to execute query: {e}"))?;
+        let result_schema = arrow.get_schema();
+        let mut arrow_batches: Vec<duckdb::arrow::array::RecordBatch> = arrow.collect();
+        if arrow_batches.is_empty() {
+            arrow_batches.push(duckdb::arrow::array::RecordBatch::new_empty(result_schema));
+        }
 
         // Annotate JSON Utf8 fields so default/jsonl encoding parses them as JSON objects.
-        let arrow_batches = annotate_json_utf8_fields(arrow_batches, &json_columns);
+        let arrow_batches =
+            annotate_json_utf8_fields(arrow_batches, &json_columns, &variant_columns);
 
-        let columns = if let Some(first) = arrow_batches.first() {
-            first
-                .schema()
-                .fields()
-                .iter()
-                .map(|f| f.name().clone())
-                .collect()
-        } else {
-            vec![]
-        };
+        let columns = arrow_batches[0]
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| {
+                Ok(QueryColumn {
+                    name: field.name().clone(),
+                    type_name: arrow_type_to_string(field)?,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
 
         Ok((columns, arrow_batches))
     })
@@ -1152,6 +1170,7 @@ fn is_json_or_variant_type(type_name: &str) -> bool {
 fn annotate_json_utf8_fields(
     batches: Vec<duckdb::arrow::array::RecordBatch>,
     json_columns: &std::collections::HashSet<String>,
+    variant_columns: &std::collections::HashSet<String>,
 ) -> Vec<duckdb::arrow::array::RecordBatch> {
     use arrow_schema::extension::{EXTENSION_TYPE_NAME_KEY, ExtensionType, Json};
     use duckdb::arrow::datatypes::{DataType, Field, Schema};
@@ -1165,12 +1184,17 @@ fn annotate_json_utf8_fields(
         .fields()
         .iter()
         .map(|field| {
-            if crate::lakehouse::format::field_is_json_utf8(field) {
-                return field.as_ref().clone();
-            }
             if json_columns.contains(field.name()) && matches!(field.data_type(), DataType::Utf8) {
                 let mut metadata = field.metadata().clone();
                 metadata.insert(EXTENSION_TYPE_NAME_KEY.to_owned(), Json::NAME.to_owned());
+                // Keep VARIANT distinguishable from JSON: the cast to JSON erases it otherwise,
+                // and the real API still reports the column as VARIANT.
+                if variant_columns.contains(field.name()) {
+                    metadata.insert(
+                        ALTERTABLE_ORIGINAL_TYPE_METADATA_KEY.to_owned(),
+                        ALTERTABLE_ORIGINAL_TYPE_VARIANT.to_owned(),
+                    );
+                }
                 return Field::new(field.name(), field.data_type().clone(), field.is_nullable())
                     .with_metadata(metadata);
             }
@@ -1452,7 +1476,7 @@ mod tests {
             .unwrap();
         let text = std::str::from_utf8(&body).unwrap();
         let lines: Vec<&str> = text.trim_end_matches('\n').split('\n').collect();
-        // line 0: stream header, line 1: column names, line 2: first data row
+        // line 0: stream header, line 1: column schema, line 2: first data row
         assert!(lines.len() >= 3, "expected at least 3 NDJSON lines");
         let header: Value = serde_json::from_str(lines[0]).unwrap();
         assert_eq!(header["statement"], "SELECT 42 AS n");
@@ -1462,7 +1486,7 @@ mod tests {
         assert_eq!(header["connections_errors"], serde_json::json!({}));
         assert_eq!(header["worker_slug"], "altertable-mock");
         let cols: Value = serde_json::from_str(lines[1]).unwrap();
-        assert_eq!(cols[0], "n");
+        assert_eq!(cols, serde_json::json!([{"name": "n", "type": "INTEGER"}]));
         let row: Value = serde_json::from_str(lines[2]).unwrap();
         assert_eq!(row[0], 42);
     }
@@ -1569,6 +1593,49 @@ mod tests {
             .unwrap();
         let text = std::str::from_utf8(&body).unwrap();
         assert_eq!(text.lines().count(), 3);
+    }
+
+    #[tokio::test]
+    async fn post_query_typed_schema_is_preserved_without_rows() {
+        let statement = r#"SELECT 1::TINYINT AS tiny, 2::BIGINT AS big, true AS flag,
+            1.25::DECIMAL(10, 2) AS amount, 'text' AS label,
+            DATE '2026-01-01' AS day, TIMESTAMP '2026-01-01' AS moment,
+            [1, 2] AS items, {'x': 1} AS nested,
+            '{"a":1}'::JSON AS payload, '{"b":2}'::JSON::VARIANT AS attributes,
+            MAP(['x'], [1]) AS mapping, [1, 2]::INTEGER[2] AS fixed_items"#;
+        let expected = serde_json::json!([
+            {"name": "tiny", "type": "TINYINT"},
+            {"name": "big", "type": "BIGINT"},
+            {"name": "flag", "type": "BOOLEAN"},
+            {"name": "amount", "type": "DECIMAL(10, 2)"},
+            {"name": "label", "type": "VARCHAR"},
+            {"name": "day", "type": "DATE"},
+            {"name": "moment", "type": "TIMESTAMP"},
+            {"name": "items", "type": "LIST"},
+            {"name": "nested", "type": "STRUCT(x INTEGER)"},
+            {"name": "payload", "type": "JSON"},
+            {"name": "attributes", "type": "VARIANT"},
+            {"name": "mapping", "type": "MAP"},
+            {"name": "fixed_items", "type": "INTEGER[]"}
+        ]);
+        for (suffix, line_count) in [("", 3), (" WHERE false", 2)] {
+            let response = query_with_format(&format!("{statement}{suffix}"), "default").await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let text = std::str::from_utf8(&body).unwrap();
+            let lines: Vec<Value> = text
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(lines[1], expected, "{text}");
+            assert_eq!(lines.len(), line_count);
+            if line_count == 3 {
+                assert_eq!(lines[2][9], serde_json::json!({"a": 1}));
+                assert_eq!(lines[2][10], serde_json::json!({"b": 2}));
+            }
+        }
     }
 
     #[tokio::test]
@@ -1743,6 +1810,23 @@ mod tests {
             batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
             3
         );
+    }
+
+    #[tokio::test]
+    async fn post_query_empty_parquet_preserves_column_schema() {
+        use arrow_schema::DataType;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let resp = query_with_format("SELECT 42::BIGINT AS n WHERE false", "parquet").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes).expect("invalid Parquet body");
+        assert_eq!(reader.schema().fields().len(), 1);
+        assert_eq!(reader.schema().field(0).name(), "n");
+        assert_eq!(reader.schema().field(0).data_type(), &DataType::Int64);
+        assert_eq!(reader.metadata().file_metadata().num_rows(), 0);
     }
 
     async fn ndjson_query_succeeded(resp: axum::http::Response<Body>) -> bool {
