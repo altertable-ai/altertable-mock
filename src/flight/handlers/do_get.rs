@@ -3,8 +3,8 @@ use arrow_flight::{
     encode::FlightDataEncoderBuilder,
     sql::{
         CommandGetCatalogs, CommandGetDbSchemas, CommandGetSqlInfo, CommandGetTableTypes,
-        CommandGetTables, CommandPreparedStatementQuery, SqlInfo, TicketStatementQuery,
-        metadata::SqlInfoDataBuilder,
+        CommandGetTables, CommandPreparedStatementQuery, CommandStatementQuery, SqlInfo,
+        TicketStatementQuery, metadata::SqlInfoDataBuilder,
     },
 };
 use arrow_schema::Schema;
@@ -15,8 +15,11 @@ use futures::{
 };
 use tonic::{Request, Response, Status};
 
+use prost::Message;
+
 use crate::{
     session::Session,
+    transaction::to_status,
     utils::{empty_params, escape_identifier, escape_literal},
 };
 
@@ -32,14 +35,21 @@ pub async fn statement(
         .get::<Session>()
         .ok_or_else(|| Status::internal("Missing session"))?;
 
-    let handle = &query.statement_handle;
-    let query = String::from_utf8_lossy(handle);
+    let handle_bytes = query.statement_handle.to_vec();
+    let (sql, transaction_id) =
+        if let Ok(cmd) = CommandStatementQuery::decode(handle_bytes.as_slice()) {
+            (cmd.query, cmd.transaction_id)
+        } else {
+            let sql = String::from_utf8(handle_bytes)
+                .map_err(|e| Status::invalid_argument(format!("Invalid statement handle: {e}")))?;
+            (sql, None)
+        };
 
-    tracing::debug!("Executing query: {}", query);
+    tracing::debug!("Executing query: {}", sql);
     let (schema, batches) = session
-        .query_arrow(query.into_owned(), empty_params())
+        .query_arrow_with_transaction(sql, empty_params(), transaction_id)
         .await
-        .map_err(|_| Status::invalid_argument("Failed to query arrow"))?;
+        .map_err(|e| to_status(&e, "Failed to query arrow"))?;
 
     let batch_stream = stream::iter(batches.into_iter().map(Ok));
     let flight_data_stream = FlightDataEncoderBuilder::new()
@@ -64,7 +74,7 @@ pub async fn catalogs(
     let (schema, batches) = session
         .query_arrow(sql.to_owned(), empty_params())
         .await
-        .map_err(|e| Status::internal(format!("Failed to execute query: {e}")))?;
+        .map_err(|e| to_status(&e, "Failed to execute query"))?;
 
     let batch_stream = stream::iter(batches.into_iter().map(Ok));
     let flight_data_stream = FlightDataEncoderBuilder::new()
@@ -105,7 +115,7 @@ pub async fn schemas(
     let (schema, batches) = session
         .query_arrow(sql, empty_params())
         .await
-        .map_err(|e| Status::internal(format!("Failed to execute query: {e}")))?;
+        .map_err(|e| to_status(&e, "Failed to execute query"))?;
 
     let batch_stream = stream::iter(batches.into_iter().map(Ok));
     let flight_data_stream = FlightDataEncoderBuilder::new()
@@ -158,7 +168,7 @@ pub async fn tables(
     let (_, batches) = session
         .query_arrow(sql, empty_params())
         .await
-        .map_err(|e| Status::internal(format!("Failed to execute query: {e}")))?;
+        .map_err(|e| to_status(&e, "Failed to execute query"))?;
 
     for batch in batches {
         let catalog_col = batch
@@ -208,7 +218,7 @@ pub async fn tables(
                     session
                         .extract_schema(schema_query)
                         .await
-                        .map_err(|e| Status::internal(format!("Failed to extract schema: {e}")))?,
+                        .map_err(|e| to_status(&e, "Failed to extract schema"))?,
                 )
             } else {
                 None
@@ -248,7 +258,7 @@ pub async fn prepared_statement(
 
     let handle = query.prepared_statement_handle.to_vec();
 
-    let (sql, params) = {
+    let (sql, params, transaction_id) = {
         let prepared_statements = session.statements.read().await;
         let prepared_statement = prepared_statements
             .get(&handle)
@@ -256,14 +266,15 @@ pub async fn prepared_statement(
         (
             prepared_statement.query.clone(),
             prepared_statement.parameters.clone(),
+            prepared_statement.transaction_id.clone(),
         )
     };
 
     tracing::debug!("Executing query: {} with params: {:?}", sql, params);
     let (schema, batches) = session
-        .query_arrow(sql, params_from_iter(params))
+        .query_arrow_with_transaction(sql, params_from_iter(params), transaction_id)
         .await
-        .map_err(|e| Status::internal(format!("Failed to execute query: {e}")))?;
+        .map_err(|e| to_status(&e, "Failed to execute query"))?;
 
     let batch_stream = stream::iter(batches.into_iter().map(Ok));
     let flight_data_stream = FlightDataEncoderBuilder::new()
@@ -289,7 +300,7 @@ pub async fn table_types(
     let (schema, batches) = session
         .query_arrow(sql.to_owned(), empty_params())
         .await
-        .map_err(|e| Status::internal(format!("Failed to execute query: {e}")))?;
+        .map_err(|e| to_status(&e, "Failed to execute query"))?;
 
     let batch_stream = stream::iter(batches.into_iter().map(Ok));
     let flight_data_stream = FlightDataEncoderBuilder::new()

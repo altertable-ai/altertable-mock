@@ -7,11 +7,10 @@ use arrow_flight::{
     },
 };
 use arrow_schema::Schema;
-use bytes::Bytes;
 use prost::Message;
 use tonic::{Request, Response, Status};
 
-use crate::session::Session;
+use crate::{session::Session, transaction::to_status};
 
 type Result<T> = std::result::Result<T, Status>;
 
@@ -46,12 +45,12 @@ pub async fn statement(
         .ok_or_else(|| Status::internal("Missing session"))?;
 
     let schema = session
-        .extract_schema(query.query.clone())
+        .extract_schema_with_transaction(query.query.clone(), query.transaction_id.clone())
         .await
-        .map_err(|e| Status::internal(format!("Failed to extract schema: {e}")))?;
+        .map_err(|e| to_status(&e, "Failed to extract schema"))?;
 
     let ticket = TicketStatementQuery {
-        statement_handle: Bytes::from(query.query.clone()),
+        statement_handle: query.encode_to_vec().into(),
     };
 
     let flight_info = make_flight_info(req.into_inner(), &ticket, &schema)?;
@@ -71,9 +70,7 @@ pub async fn prepared_statement(
     let schema = session
         .extract_prepared_statement_schema(cmd.prepared_statement_handle.as_ref())
         .await
-        .map_err(|e| {
-            Status::invalid_argument(format!("Failed to extract prepared statement schema: {e}"))
-        })?;
+        .map_err(|e| to_status(&e, "Failed to extract prepared statement schema"))?;
 
     let flight_info = make_flight_info(req.into_inner(), &cmd, &schema)?;
 

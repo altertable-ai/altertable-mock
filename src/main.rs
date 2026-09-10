@@ -3,6 +3,7 @@ mod flight;
 mod lakehouse;
 mod product_analytics;
 mod session;
+mod transaction;
 mod utils;
 
 use std::sync::Arc;

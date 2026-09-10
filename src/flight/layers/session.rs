@@ -10,7 +10,7 @@ use tonic::{Request, Status};
 use tonic_async_interceptor::{AsyncInterceptor, AsyncInterceptorLayer, async_interceptor};
 use tracing::info;
 
-use crate::{compute_size::ComputeSize, session::Session};
+use crate::session::Session;
 
 use super::auth::{Identity, SessionID};
 
@@ -90,14 +90,7 @@ impl AsyncInterceptor for SessionMiddleware {
                 .await
                 .map_err(|e| Status::internal(format!("Failed to clone connection: {e}")))??;
 
-                let conn = Arc::new(Mutex::new(new_conn));
-                let session = Session {
-                    connection: conn,
-                    statements: Arc::new(RwLock::new(HashMap::new())),
-                    catalog: Arc::new(RwLock::new(None)),
-                    schema: Arc::new(RwLock::new(None)),
-                    compute_size: Arc::new(RwLock::new(ComputeSize::default())),
-                };
+                let session = Session::new(new_conn);
 
                 session_store.write().await.insert(key, session.clone());
                 session
