@@ -124,10 +124,6 @@ impl Session {
         .await?
     }
 
-    pub async fn execute(&self, query: impl SendableString) -> anyhow::Result<i64> {
-        self.execute_with_transaction(query, None).await
-    }
-
     pub async fn execute_with_transaction(
         &self,
         query: impl SendableString,
@@ -458,11 +454,14 @@ mod tests {
     async fn transaction_sees_session_temp_table() {
         let session = test_session();
         session
-            .execute("CREATE TEMP TABLE temp_source (id INTEGER, value VARCHAR)")
+            .execute_with_transaction(
+                "CREATE TEMP TABLE temp_source (id INTEGER, value VARCHAR)",
+                None,
+            )
             .await
             .unwrap();
         session
-            .execute("INSERT INTO temp_source VALUES (1, 'from_temp')")
+            .execute_with_transaction("INSERT INTO temp_source VALUES (1, 'from_temp')", None)
             .await
             .unwrap();
 
@@ -490,11 +489,14 @@ mod tests {
     async fn transaction_rollback_discards_table_created_from_temp() {
         let session = test_session();
         session
-            .execute("CREATE TEMP TABLE temp_source (id INTEGER, value VARCHAR)")
+            .execute_with_transaction(
+                "CREATE TEMP TABLE temp_source (id INTEGER, value VARCHAR)",
+                None,
+            )
             .await
             .unwrap();
         session
-            .execute("INSERT INTO temp_source VALUES (1, 'from_temp')")
+            .execute_with_transaction("INSERT INTO temp_source VALUES (1, 'from_temp')", None)
             .await
             .unwrap();
 
@@ -539,7 +541,10 @@ mod tests {
         let session = test_session();
         let tx_id = session.begin_transaction().await.unwrap();
 
-        let err = session.execute("SELECT 1").await.unwrap_err();
+        let err = session
+            .execute_with_transaction("SELECT 1", None)
+            .await
+            .unwrap_err();
         assert_eq!(err.to_string(), TRANSACTION_ALREADY_ACTIVE_MESSAGE);
 
         session
