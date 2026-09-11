@@ -23,6 +23,7 @@ use tonic::{Request, Status};
 
 use crate::{
     session::Session,
+    transaction::{TransactionId, to_status},
     utils::{MAIN_SCHEMA, MEMORY_DB, SendableString, TEMP_DB, escape_identifier},
 };
 
@@ -103,9 +104,9 @@ pub async fn statement_update(
 
     tracing::debug!("Executing query: {}", ticket.query);
     let res = session
-        .execute(ticket.query)
+        .execute_with_transaction(ticket.query, ticket.transaction_id)
         .await
-        .map_err(|e| Status::internal(format!("Failed to execute query: {e}")))?;
+        .map_err(|e| to_status(&e, "Failed to execute query"))?;
 
     Ok(res)
 }
@@ -152,20 +153,23 @@ pub async fn prepared_statement_update(
 
     let parameters = extract_parameters_from_stream(stream).await?;
 
-    let sql = {
+    let (sql, transaction_id) = {
         let mut prepared_statements = session.statements.write().await;
         let prepared_statement = prepared_statements
             .get_mut(&handle)
             .ok_or_else(|| Status::not_found("Prepared statement not found"))?;
         prepared_statement.parameters = parameters;
-        prepared_statement.query.clone()
+        (
+            prepared_statement.query.clone(),
+            prepared_statement.transaction_id.clone(),
+        )
     };
 
     tracing::debug!("Executing query: {}", sql);
     let res = session
-        .execute(sql)
+        .execute_with_transaction(sql, transaction_id)
         .await
-        .map_err(|e| Status::internal(format!("Failed to execute query: {e}")))?;
+        .map_err(|e| to_status(&e, "Failed to execute query"))?;
 
     Ok(res)
 }
@@ -184,6 +188,7 @@ pub async fn statement_ingest(
     let catalog_name = Arc::new(command.catalog.as_deref().unwrap_or(MEMORY_DB).to_owned());
     let schema_name = Arc::new(command.schema.as_deref().unwrap_or(MAIN_SCHEMA).to_owned());
     let table_name = Arc::new(command.table);
+    let transaction_id = command.transaction_id;
 
     let full_table_name = format!(
         "\"{}\".\"{}\".\"{}\"",
@@ -193,13 +198,14 @@ pub async fn statement_ingest(
     );
 
     let mut table_exists = session
-        .table_exists(
+        .table_exists_with_transaction(
             catalog_name.clone(),
             schema_name.clone(),
             table_name.clone(),
+            transaction_id.clone(),
         )
         .await
-        .map_err(|_| Status::internal("Failed to check if table exists"))?;
+        .map_err(|e| to_status(&e, "Failed to check if table exists"))?;
 
     if let Some(table_def_options) = &command.table_definition_options {
         let if_not_exist = TableNotExistOption::try_from(table_def_options.if_not_exist)
@@ -238,13 +244,14 @@ pub async fn statement_ingest(
             }
             (true, _, TableExistsOption::Replace) => {
                 session
-                    .drop_table_if_exists(
+                    .drop_table_if_exists_with_transaction(
                         catalog_name.clone(),
                         schema_name.clone(),
                         table_name.clone(),
+                        transaction_id.clone(),
                     )
                     .await
-                    .map_err(|_| Status::internal("Failed to drop table"))?;
+                    .map_err(|e| to_status(&e, "Failed to drop table"))?;
                 table_exists = false;
             }
             _ => {}
@@ -277,14 +284,15 @@ pub async fn statement_ingest(
 
     if !table_exists {
         session
-            .create_table_from_schema(
+            .create_table_from_schema_with_transaction(
                 catalog_name.clone(),
                 schema_name.clone(),
                 table_name.clone(),
                 schema.clone(),
+                transaction_id.clone(),
             )
             .await
-            .map_err(|_| Status::internal("Failed to create table"))?;
+            .map_err(|e| to_status(&e, "Failed to create table"))?;
     }
 
     if options.is_upsert() {
@@ -296,6 +304,7 @@ pub async fn statement_ingest(
             &options,
             schema,
             record_batch_stream,
+            transaction_id,
         )
         .await
     } else {
@@ -305,11 +314,13 @@ pub async fn statement_ingest(
             schema_name,
             table_name,
             record_batch_stream,
+            transaction_id,
         )
         .await
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn upsert_record_batches<S>(
     session: &Session,
     catalog_name: impl SendableString,
@@ -318,6 +329,7 @@ async fn upsert_record_batches<S>(
     options: &StatementIngestOptions,
     schema: SchemaRef,
     record_batch_stream: S,
+    transaction_id: Option<TransactionId>,
 ) -> Result<i64, Status>
 where
     S: Stream<Item = Result<RecordBatch, FlightError>> + Unpin,
@@ -332,14 +344,15 @@ where
     ));
 
     session
-        .create_table_from_schema(
+        .create_table_from_schema_with_transaction(
             TEMP_DB,
             MAIN_SCHEMA,
             temp_table_name.clone(),
             schema.clone(),
+            transaction_id.clone(),
         )
         .await
-        .map_err(|_| Status::internal("Failed to create temporary table"))?;
+        .map_err(|e| to_status(&e, "Failed to create temporary table"))?;
 
     let _rows_inserted = insert_record_batches(
         session,
@@ -347,6 +360,7 @@ where
         MAIN_SCHEMA,
         temp_table_name.clone(),
         record_batch_stream,
+        transaction_id.clone(),
     )
     .await?;
 
@@ -479,14 +493,19 @@ where
     );
 
     let affected_rows = session
-        .execute(merge_sql)
+        .execute_with_transaction(merge_sql, transaction_id.clone())
         .await
-        .map_err(|e| Status::internal(format!("Failed to execute MERGE: {e}")))?;
+        .map_err(|e| to_status(&e, "Failed to execute MERGE"))?;
 
     session
-        .drop_table_if_exists(TEMP_DB, MAIN_SCHEMA, temp_table_name)
+        .drop_table_if_exists_with_transaction(
+            TEMP_DB,
+            MAIN_SCHEMA,
+            temp_table_name,
+            transaction_id,
+        )
         .await
-        .map_err(|_| Status::internal("Failed to drop temporary table"))?;
+        .map_err(|e| to_status(&e, "Failed to drop temporary table"))?;
 
     Ok(affected_rows)
 }
@@ -497,6 +516,7 @@ async fn insert_record_batches<S>(
     schema_name: impl SendableString,
     table_name: impl SendableString,
     mut record_batch_stream: S,
+    transaction_id: Option<TransactionId>,
 ) -> Result<i64, Status>
 where
     S: Stream<Item = Result<RecordBatch, FlightError>> + Unpin,
@@ -504,11 +524,21 @@ where
     let (tx, mut rx) = tokio::sync::mpsc::channel::<RecordBatch>(INGEST_CHANNEL_BUFFER);
 
     let connection = session.connection.clone();
+    let active_transaction = session.active_transaction.clone();
     #[allow(clippy::result_large_err)]
     let writer_handle = tokio::task::spawn_blocking(move || {
         let conn = connection
             .lock()
             .map_err(|_| Status::internal("Failed to lock connection"))?;
+
+        match &transaction_id {
+            Some(id) => active_transaction
+                .require(id)
+                .map_err(|e| to_status(&e, "Failed to require transaction"))?,
+            None => active_transaction
+                .require_absent()
+                .map_err(|e| to_status(&e, "Failed to require absent transaction"))?,
+        }
 
         let mut appender = conn
             .appender_to_catalog_and_db(

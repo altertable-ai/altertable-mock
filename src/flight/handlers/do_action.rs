@@ -22,6 +22,7 @@ use crate::{
         set_session_options_result_error,
     },
     session::{PreparedStatement, Session},
+    transaction::{EndAction, TransactionId, to_status},
     utils::SendableString,
 };
 
@@ -34,11 +35,11 @@ type Result<T> = std::result::Result<T, Status>;
 async fn extract_parameter_schema(
     session: &Session,
     sql: impl SendableString,
+    transaction_id: Option<TransactionId>,
 ) -> anyhow::Result<Option<Vec<u8>>> {
     let parameter_schema = session
-        .extract_parameter_schema(sql)
-        .await
-        .map_err(|e| Status::internal(format!("Failed to extract parameter schema: {e}")))?;
+        .extract_parameter_schema_with_transaction(sql, transaction_id)
+        .await?;
 
     match parameter_schema {
         Some(schema) => {
@@ -65,10 +66,11 @@ pub async fn create_prepared_statement(
     let handle = Uuid::new_v4().as_bytes().to_vec();
 
     let sql = Arc::new(query.query);
+    let transaction_id = query.transaction_id;
     let schema = session
-        .extract_schema(sql.clone())
+        .extract_schema_with_transaction(sql.clone(), transaction_id.clone())
         .await
-        .map_err(|e| Status::internal(format!("Failed to extract schema: {e}")))?;
+        .map_err(|e| to_status(&e, "Failed to extract schema"))?;
 
     let ipc_options = IpcWriteOptions::default();
     let schema_ipc = arrow_flight::SchemaAsIpc::new(&schema, &ipc_options);
@@ -77,13 +79,15 @@ pub async fn create_prepared_statement(
         .map_err(|e| Status::internal(format!("Failed to convert schema to IPC: {e}")))?;
     let schema_bytes = ipc_message.0;
 
-    let parameter_schema_bytes = extract_parameter_schema(session, sql.clone())
-        .await
-        .map_err(|e| Status::internal(format!("Failed to extract parameter schema: {e}")))?;
+    let parameter_schema_bytes =
+        extract_parameter_schema(session, sql.clone(), transaction_id.clone())
+            .await
+            .map_err(|e| to_status(&e, "Failed to extract parameter schema"))?;
 
     let prepared_statement = PreparedStatement {
         query: sql.as_str().to_owned(),
         parameters: Vec::new(),
+        transaction_id,
     };
 
     session
@@ -134,17 +138,9 @@ pub async fn begin_transaction(
         .get::<Session>()
         .ok_or_else(|| Status::internal("Missing session"))?;
 
-    let transaction_id = Uuid::new_v4().to_string();
+    let transaction_id = session.begin_transaction().await?;
 
-    tracing::debug!("Executing query: BEGIN TRANSACTION");
-    session
-        .execute("BEGIN TRANSACTION")
-        .await
-        .map_err(|e| Status::internal(format!("Failed to execute query: {e}")))?;
-
-    Ok(ActionBeginTransactionResult {
-        transaction_id: transaction_id.as_bytes().to_vec().into(),
-    })
+    Ok(ActionBeginTransactionResult { transaction_id })
 }
 
 pub async fn end_transaction(
@@ -156,19 +152,13 @@ pub async fn end_transaction(
         .get::<Session>()
         .ok_or_else(|| Status::internal("Missing session"))?;
 
-    let sql = match query.action {
-        1 => "COMMIT",
-        2 => "ROLLBACK",
+    let action = match query.action {
+        1 => EndAction::Commit,
+        2 => EndAction::Rollback,
         _ => return Err(Status::invalid_argument("Invalid transaction action")),
     };
 
-    tracing::debug!("Executing query: {}", sql);
-    session
-        .execute(sql)
-        .await
-        .map_err(|e| Status::internal(format!("Failed to execute query: {e}")))?;
-
-    Ok(())
+    session.end_transaction(&query.transaction_id, action).await
 }
 
 pub async fn set_session_options(request: Request<Action>) -> Result<SetSessionOptionsResult> {
