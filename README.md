@@ -4,7 +4,7 @@
 [![GHCR](https://img.shields.io/badge/ghcr.io-altertable--mock-blue?logo=github)](https://github.com/altertable-ai/altertable-mock/pkgs/container/altertable-mock)
 [![CI](https://github.com/altertable-ai/altertable-mock/actions/workflows/ci.yml/badge.svg)](https://github.com/altertable-ai/altertable-mock/actions/workflows/ci.yml)
 
-A mock server that implements the full [Altertable](https://altertable.ai) API surface — [Arrow Flight SQL](https://arrow.apache.org/docs/format/FlightSql.html) (gRPC), Lakehouse REST, and Product Analytics REST — backed by an in-memory [DuckDB](https://duckdb.org) instance. Intended for local development and testing.
+A mock server that implements the full [Altertable](https://altertable.ai) API surface — [Arrow Flight SQL](https://arrow.apache.org/docs/format/FlightSql.html) (gRPC), Lakehouse REST, and Product Analytics REST — backed by [DuckLake](https://ducklake.select) on DuckDB 1.5.5. Intended for local development and testing.
 
 ## What it is
 
@@ -16,7 +16,7 @@ Altertable exposes three interfaces:
 
 This server speaks all three protocols and behaves similarly to the real service, without requiring a real Altertable account or any external infrastructure.
 
-Each authenticated user gets their own isolated in-memory DuckDB database. Sessions within a user share that database. The server supports:
+Each authenticated user gets their own DuckLake. Its catalog is an in-memory DuckDB database and its data files live in a temporary directory for the life of that lakehouse. The default catalog name remains `memory`. Sessions within a user share that lakehouse. The server supports:
 
 - Ad-hoc SQL queries and DML statements
 - Prepared statements with parameter binding
@@ -28,7 +28,7 @@ Each authenticated user gets their own isolated in-memory DuckDB database. Sessi
 
 - Run integration tests against a real Flight SQL endpoint without hitting production
 - Develop locally without network access or credentials
-- Deterministic, ephemeral state — the in-memory database resets when the server stops
+- Deterministic, ephemeral state — DuckLake metadata is discarded when the server stops
 - Fast and self-contained — no external services required
 
 ## Ports
@@ -213,7 +213,7 @@ All endpoints return `{"ok": true}` on success or `{"ok": false, "error_code": "
 
 ## Building from source
 
-DuckDB is compiled in via the `bundled` feature, so no external shared library is required.
+The build links DuckDB 1.5.5: set `DUCKDB_DOWNLOAD_LIB=1` to download it, or point `DUCKDB_LIB_DIR` at a local copy. Lakehouse connections run `LOAD ducklake`, so the extension must already be installed for DuckDB 1.5.5 (`INSTALL ducklake;`). The Docker image installs it at build time.
 
 ```bash
 cargo build --release

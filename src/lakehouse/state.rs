@@ -9,7 +9,7 @@ use crate::flight::layers::auth::Identity;
 
 use super::types::QueryLog;
 
-pub type LakehouseStore = Arc<RwLock<HashMap<Identity, Arc<Mutex<Connection>>>>>;
+pub type LakehouseStore = Arc<RwLock<HashMap<Identity, crate::ducklake::SharedLakehouse>>>;
 pub type QueryStore = Arc<RwLock<HashMap<Uuid, QueryLog>>>;
 
 #[derive(Clone)]
@@ -31,16 +31,20 @@ impl LakehouseState {
     pub async fn get_or_create_connection(&self, identity: &Identity) -> Arc<Mutex<Connection>> {
         {
             let store = self.lakehouse_store.read().await;
-            if let Some(conn) = store.get(identity) {
-                return conn.clone();
+            if let Some(lakehouse) = store.get(identity) {
+                return lakehouse.connection.clone();
             }
         }
 
-        let conn = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
+        let lakehouse = tokio::task::spawn_blocking(crate::ducklake::SharedLakehouse::open)
+            .await
+            .expect("DuckLake open task failed")
+            .expect("failed to open DuckLake");
+        let conn = lakehouse.connection.clone();
         self.lakehouse_store
             .write()
             .await
-            .insert(identity.clone(), conn.clone());
+            .insert(identity.clone(), lakehouse);
         conn
     }
 }
