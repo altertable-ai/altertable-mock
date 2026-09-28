@@ -22,24 +22,25 @@ pub fn layer() -> AsyncInterceptorLayer<
 
 pub fn interceptor()
 -> impl AsyncInterceptor<Future = BoxFuture<'static, Result<Request<()>, Status>>> + Clone {
-    let lakehouse_store = Arc::new(RwLock::new(HashMap::new()));
     let session_store = Arc::new(RwLock::new(HashMap::new()));
+    let lakehouse_store = Arc::new(RwLock::new(HashMap::new()));
     SessionMiddleware {
-        lakehouse_store,
         session_store,
+        lakehouse_store,
     }
 }
 
 type LakehouseKey = Identity;
-type LakehouseStore = Arc<RwLock<HashMap<LakehouseKey, Arc<Mutex<Connection>>>>>;
+type LakehouseStore = Arc<RwLock<HashMap<LakehouseKey, crate::ducklake::SharedLakehouse>>>;
 
 type SessionKey = (Identity, SessionID);
 type SessionStore = Arc<RwLock<HashMap<SessionKey, Session>>>;
 
 #[derive(Clone)]
 struct SessionMiddleware {
-    lakehouse_store: LakehouseStore,
+    // Drop sessions before lakehouses so DuckLake files outlive cloned connections.
     session_store: SessionStore,
+    lakehouse_store: LakehouseStore,
 }
 
 impl AsyncInterceptor for SessionMiddleware {
@@ -78,7 +79,7 @@ impl AsyncInterceptor for SessionMiddleware {
                 );
 
                 let lakehouse =
-                    get_or_create_lakehouse(key.0.clone(), lakehouse_store.clone()).await;
+                    get_or_create_lakehouse(key.0.clone(), lakehouse_store.clone()).await?;
                 #[allow(clippy::result_large_err)]
                 let new_conn = tokio::task::spawn_blocking(move || {
                     lakehouse
@@ -106,13 +107,17 @@ impl AsyncInterceptor for SessionMiddleware {
 async fn get_or_create_lakehouse(
     key: LakehouseKey,
     store: LakehouseStore,
-) -> Arc<Mutex<Connection>> {
-    if let Some(connection) = store.read().await.get(&key).cloned() {
-        connection
-    } else {
-        info!("Creating new lakehouse for user: {}", key.username);
-        let connection = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
-        store.write().await.insert(key, connection.clone());
-        connection
+) -> Result<Arc<Mutex<Connection>>, Status> {
+    if let Some(lakehouse) = store.read().await.get(&key) {
+        return Ok(lakehouse.connection.clone());
     }
+
+    info!("Creating new lakehouse for user: {}", key.username);
+    let lakehouse = tokio::task::spawn_blocking(crate::ducklake::SharedLakehouse::open)
+        .await
+        .map_err(|e| Status::internal(format!("Failed to open DuckLake: {e}")))?
+        .map_err(|e| Status::internal(format!("Failed to open DuckLake: {e}")))?;
+    let connection = lakehouse.connection.clone();
+    store.write().await.insert(key, lakehouse);
+    Ok(connection)
 }

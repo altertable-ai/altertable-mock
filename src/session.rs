@@ -16,7 +16,7 @@ use crate::{
     compute_size::ComputeSize,
     flight::schema_extractor::{extract_parameter_schema, extract_schema},
     transaction::{ActiveTransaction, EndAction, TransactionId, to_status},
-    utils::{SendableString, TEMP_DB, empty_params, escape_identifier, escape_literal},
+    utils::{MEMORY_DB, SendableString, TEMP_DB, empty_params, escape_identifier, escape_literal},
 };
 use tonic::Status;
 use uuid::Uuid;
@@ -330,11 +330,10 @@ impl Session {
                 None => active_transaction.require_absent()?,
             }
 
-            if let Some(catalog) = catalog {
-                let query = format!("USE {}", escape_identifier(&catalog));
-                tracing::debug!("Executing query: {}", query);
-                connection.execute(&query, empty_params())?;
-            }
+            let catalog = catalog.unwrap_or_else(|| MEMORY_DB.to_owned());
+            let query = format!("USE {}", escape_identifier(&catalog));
+            tracing::debug!("Executing query: {}", query);
+            connection.execute(&query, empty_params())?;
 
             if let Some(schema) = schema {
                 let query = format!("USE {}", escape_identifier(&schema));
@@ -446,13 +445,14 @@ mod tests {
     use super::*;
     use crate::transaction::TRANSACTION_ALREADY_ACTIVE_MESSAGE;
 
-    fn test_session() -> Session {
-        Session::new(Connection::open_in_memory().unwrap())
+    fn test_session() -> (Session, crate::ducklake::DataDir) {
+        let (connection, data_dir) = crate::ducklake::open().expect("failed to open DuckLake");
+        (Session::new(connection), data_dir)
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn transaction_sees_session_temp_table() {
-        let session = test_session();
+        let (session, _data_dir) = test_session();
         session
             .execute_with_transaction(
                 "CREATE TEMP TABLE temp_source (id INTEGER, value VARCHAR)",
@@ -487,7 +487,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn transaction_rollback_discards_table_created_from_temp() {
-        let session = test_session();
+        let (session, _data_dir) = test_session();
         session
             .execute_with_transaction(
                 "CREATE TEMP TABLE temp_source (id INTEGER, value VARCHAR)",
@@ -523,7 +523,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn begin_transaction_rejects_second_active_transaction() {
-        let session = test_session();
+        let (session, _data_dir) = test_session();
         let tx_id = session.begin_transaction().await.unwrap();
 
         let err = session.begin_transaction().await.unwrap_err();
@@ -538,7 +538,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn execute_without_transaction_id_rejected_while_active() {
-        let session = test_session();
+        let (session, _data_dir) = test_session();
         let tx_id = session.begin_transaction().await.unwrap();
 
         let err = session
@@ -555,7 +555,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn execute_with_unknown_transaction_id_is_rejected() {
-        let session = test_session();
+        let (session, _data_dir) = test_session();
         let tx_id = session.begin_transaction().await.unwrap();
         let unknown: TransactionId = uuid::Uuid::now_v7().as_bytes().to_vec().into();
 
@@ -569,5 +569,30 @@ mod tests {
             .end_transaction(&tx_id, EndAction::Rollback)
             .await
             .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_table_with_unique_constraint_is_rejected() {
+        let (session, _data_dir) = test_session();
+
+        let err = session
+            .execute_with_transaction(
+                "CREATE TABLE users (id INTEGER, email VARCHAR UNIQUE)",
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("PRIMARY KEY/UNIQUE constraints are not supported in DuckLake"),
+            "{err}"
+        );
+
+        assert!(
+            !session
+                .table_exists_with_transaction("memory", "main", "users", None)
+                .await
+                .unwrap()
+        );
     }
 }

@@ -1,5 +1,7 @@
 use std::{ffi::CString, ptr, sync::Arc};
 
+use std::sync::Mutex;
+
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use duckdb::ffi::{
     DUCKDB_TYPE, DUCKDB_TYPE_DUCKDB_TYPE_BIGINT, DUCKDB_TYPE_DUCKDB_TYPE_BLOB,
@@ -34,13 +36,30 @@ impl Drop for PreparedStatementGuard {
     }
 }
 
+// duckdb-rs 1.10505 removed `Connection::raw_connection`. `InterruptHandle` still
+// stores that same `duckdb_connection`, and its only field is the mutex around it.
+fn raw_connection(conn: &duckdb::Connection) -> duckdb::ffi::duckdb_connection {
+    struct InterruptHandleLayout {
+        conn: Mutex<duckdb::ffi::duckdb_connection>,
+    }
+
+    let handle = conn.interrupt_handle();
+    unsafe {
+        let layout = &*std::sync::Arc::as_ptr(&handle).cast::<InterruptHandleLayout>();
+        *layout
+            .conn
+            .lock()
+            .expect("DuckDB interrupt handle lock poisoned")
+    }
+}
+
 // Since `duckdb::Statement` does not provide a way to get the schema without executing the statement,
 // we need to use the low-level FFI API
 pub fn extract_schema(conn: &duckdb::Connection, sql: &str) -> anyhow::Result<Schema> {
     let c_sql = CString::new(sql).map_err(|e| anyhow::anyhow!("Invalid SQL: {e}"))?;
 
     unsafe {
-        let raw_conn = conn.raw_connection();
+        let raw_conn = raw_connection(conn);
 
         let mut prep: duckdb_prepared_statement = ptr::null_mut();
         let _guard = PreparedStatementGuard { stmt: &mut prep };
@@ -87,7 +106,7 @@ pub fn extract_parameter_schema(
     let c_sql = CString::new(sql).map_err(|e| anyhow::anyhow!("Invalid SQL: {e}"))?;
 
     unsafe {
-        let raw_conn = conn.raw_connection();
+        let raw_conn = raw_connection(conn);
 
         let mut prep: duckdb_prepared_statement = ptr::null_mut();
         let _guard = PreparedStatementGuard { stmt: &mut prep };
@@ -235,5 +254,28 @@ unsafe fn logical_type_to_arrow_type(ltyp: duckdb_logical_type) -> DataType {
             tracing::warn!("Unknown DuckDB type ID: {type_id}, using Null as fallback");
             DataType::Null
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_result_columns_without_executing() {
+        let (conn, _data_dir) = crate::ducklake::open().unwrap();
+        conn.execute_batch("CREATE TABLE people (id INTEGER, name VARCHAR)")
+            .unwrap();
+
+        let schema = extract_schema(&conn, "SELECT id, name FROM people WHERE id = $id").unwrap();
+        assert_eq!(schema.fields().len(), 2);
+        assert_eq!(schema.field(0).name(), "id");
+        assert_eq!(schema.field(1).name(), "name");
+
+        let parameters =
+            extract_parameter_schema(&conn, "SELECT id, name FROM people WHERE id = $id")
+                .unwrap()
+                .unwrap();
+        assert_eq!(parameters.fields().len(), 1);
     }
 }

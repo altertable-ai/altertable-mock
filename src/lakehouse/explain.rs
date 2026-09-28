@@ -135,7 +135,7 @@ mod tests {
 
     #[test]
     fn test_explain_statement_against_duckdb() {
-        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let (conn, _data_dir) = crate::ducklake::open().unwrap();
         conn.execute("CREATE TABLE events (id INTEGER, category VARCHAR)", [])
             .unwrap();
         conn.execute(
