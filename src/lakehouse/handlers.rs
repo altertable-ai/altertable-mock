@@ -1492,6 +1492,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn post_query_binds_named_parameters_without_changing_sql() {
+        let statement = "SELECT $text AS text, $integer AS integer, $decimal AS decimal, $boolean AS boolean, CAST($nullable AS VARCHAR) AS nullable, $text AS repeated LIMIT $limit";
+        let params = serde_json::json!({
+            "text": "O'Reilly; $integer", "integer": 42, "decimal": 1.5,
+            "boolean": false, "nullable": null, "limit": 1,
+        });
+        let response = make_router(make_state()).oneshot(
+            Request::builder().method(Method::POST).uri("/query")
+                .header(header::AUTHORIZATION, basic_auth_header())
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::json!({ "statement": statement, "params": params, "limit": 10 }).to_string())).unwrap()
+        ).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let lines: Vec<Value> = std::str::from_utf8(&body)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines[0]["statement"], statement);
+        assert_eq!(lines.len(), 3, "query failed: {lines:?}");
+        assert_eq!(
+            lines[2],
+            serde_json::json!([
+                "O'Reilly; $integer",
+                42,
+                1.5,
+                false,
+                null,
+                "O'Reilly; $integer"
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn post_query_rejects_missing_extra_and_non_scalar_parameters() {
+        for params in [
+            serde_json::json!({}),
+            serde_json::json!({ "value": 1, "extra": 2 }),
+            serde_json::json!({ "value": [1] }),
+            serde_json::json!({ "value": { "nested": 1 } }),
+        ] {
+            let response = make_router(make_state())
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/query")
+                        .header(header::AUTHORIZATION, basic_auth_header())
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            serde_json::json!({ "statement": "SELECT $value", "params": params })
+                                .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let lines: Vec<Value> = std::str::from_utf8(&body)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert!(
+                lines[1]["error"].is_string(),
+                "expected parameter error: {lines:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn post_query_response_contains_query_id() {
         let app = make_router(make_state());
         let query_id = uuid::Uuid::new_v4().to_string();
