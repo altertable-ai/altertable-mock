@@ -9,6 +9,8 @@ use uuid::Uuid;
 #[allow(dead_code)]
 pub struct QueryRequest {
     pub statement: String,
+    #[serde(default)]
+    pub params: HashMap<String, serde_json::Value>,
     pub session_id: Option<String>,
     pub catalog: Option<String>,
     pub schema: Option<String>,

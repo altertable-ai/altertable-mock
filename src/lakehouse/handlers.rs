@@ -120,6 +120,7 @@ pub async fn post_query(
     let result = execute_query(
         conn,
         &statement,
+        req.params,
         catalog.as_deref(),
         schema_name.as_deref(),
         limit,
@@ -1034,9 +1035,50 @@ fn set_catalog_schema(
     Ok(())
 }
 
+// DuckDB supplies parameter names and order; SQL is never interpolated.
+fn bind_query_parameters(
+    statement: &duckdb::Statement<'_>,
+    params: &HashMap<String, Value>,
+) -> anyhow::Result<Vec<duckdb::types::Value>> {
+    use duckdb::types::Value as SqlValue;
+
+    let mut values = Vec::with_capacity(statement.parameter_count());
+    for index in 1..=statement.parameter_count() {
+        let name = statement.parameter_name(index)?;
+        let value = params
+            .get(&name)
+            .ok_or_else(|| anyhow::anyhow!("Missing query parameter: {name}"))?;
+        let value = match value {
+            Value::Null => SqlValue::Null,
+            Value::Bool(value) => SqlValue::Boolean(*value),
+            Value::String(value) => SqlValue::Text(value.clone()),
+            Value::Number(value) => {
+                if let Some(value) = value.as_i64() {
+                    SqlValue::BigInt(value)
+                } else if let Some(value) = value.as_u64() {
+                    SqlValue::UBigInt(value)
+                } else {
+                    SqlValue::Double(value.as_f64().ok_or_else(|| {
+                        anyhow::anyhow!("Invalid numeric query parameter: {name}")
+                    })?)
+                }
+            }
+            Value::Array(_) | Value::Object(_) => {
+                anyhow::bail!("Query parameter {name} must be a scalar value")
+            }
+        };
+        values.push(value);
+    }
+    if params.len() != values.len() {
+        anyhow::bail!("Unknown query parameters");
+    }
+    Ok(values)
+}
+
 async fn execute_query(
     conn: Arc<Mutex<Connection>>,
     statement: &str,
+    params: HashMap<String, Value>,
     catalog: Option<&str>,
     schema: Option<&str>,
     limit: Option<u64>,
@@ -1081,8 +1123,9 @@ async fn execute_query(
             .map_err(|e| anyhow::anyhow!("Failed to prepare statement: {e}"))?;
 
         // Use query_arrow which executes the statement and gives schema + data
+        let parameters = bind_query_parameters(&stmt, &params)?;
         let arrow = stmt
-            .query_arrow(duckdb::params![])
+            .query_arrow(duckdb::params_from_iter(parameters))
             .map_err(|e| anyhow::anyhow!("Failed to execute query: {e}"))?;
         let result_schema = arrow.get_schema();
         let mut arrow_batches: Vec<duckdb::arrow::array::RecordBatch> = arrow.collect();
