@@ -62,6 +62,17 @@ cargo build --release
 ./target/release/altertable-mock --user alice:secret --user bob:hunter2
 ```
 
+### Named HTTP query parameters
+
+`POST /query` accepts a `params` object with string, numeric, boolean, or null values.
+DuckDB binds them to named placeholders without changing the statement:
+
+```json
+{ "statement": "SELECT $value AS value", "params": { "value": 42 } }
+```
+
+Missing, unknown, or non-scalar parameters return a query error through the usual response format.
+
 ### Options
 
 | Flag               | Short | Env var                          | Default      | Description                                                                                                                                                                                 |
