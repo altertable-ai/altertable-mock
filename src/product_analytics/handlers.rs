@@ -23,15 +23,12 @@ pub async fn post_track(
     let payloads = req.into_vec();
 
     for payload in payloads {
-        let Some(env_state) = state
-            .get_environment(&api_key.0, &payload.environment)
-            .await
-        else {
+        let Some(env_state) = state.get_environment(&api_key.0).await else {
             return (
-                StatusCode::BAD_REQUEST,
+                StatusCode::UNAUTHORIZED,
                 axum::Json(TrackResponse {
                     ok: false,
-                    error_code: Some("environment-not-found".to_owned()),
+                    error_code: Some("invalid-api-key".to_owned()),
                 }),
             );
         };
@@ -86,15 +83,12 @@ pub async fn post_identify(
     let payloads = req.into_vec();
 
     for payload in payloads {
-        let Some(env_state) = state
-            .get_environment(&api_key.0, &payload.environment)
-            .await
-        else {
+        let Some(env_state) = state.get_environment(&api_key.0).await else {
             return (
-                StatusCode::BAD_REQUEST,
+                StatusCode::UNAUTHORIZED,
                 axum::Json(IdentifyResponse {
                     ok: false,
-                    error_code: Some("environment-not-found".to_owned()),
+                    error_code: Some("invalid-api-key".to_owned()),
                 }),
             );
         };
@@ -149,15 +143,12 @@ pub async fn post_alias(
     let payloads = req.into_vec();
 
     for payload in payloads {
-        let Some(env_state) = state
-            .get_environment(&api_key.0, &payload.environment)
-            .await
-        else {
+        let Some(env_state) = state.get_environment(&api_key.0).await else {
             return (
-                StatusCode::BAD_REQUEST,
+                StatusCode::UNAUTHORIZED,
                 axum::Json(AliasResponse {
                     ok: false,
-                    error_code: Some("environment-not-found".to_owned()),
+                    error_code: Some("invalid-api-key".to_owned()),
                 }),
             );
         };
@@ -511,14 +502,7 @@ mod tests {
     fn make_state() -> ProductAnalyticsState {
         let mut set = HashSet::new();
         set.insert(TEST_API_KEY.to_owned());
-        ProductAnalyticsState::with_environments(
-            Arc::new(set),
-            &[
-                "production".to_owned(),
-                "prod".to_owned(),
-                "staging".to_owned(),
-            ],
-        )
+        ProductAnalyticsState::new(Arc::new(set))
     }
 
     fn api_key_header() -> (&'static str, &'static str) {
@@ -529,6 +513,7 @@ mod tests {
         Router::new()
             .route("/track", routing::post(post_track))
             .route("/identify", routing::post(post_identify))
+            .route("/alias", routing::post(post_alias))
             .route_layer(middleware::from_fn_with_state(
                 state.clone(),
                 auth_middleware,
@@ -537,15 +522,11 @@ mod tests {
     }
 
     /// Query the in-memory DuckDB for `env` and return rows as JSON values.
-    async fn query_env(
-        state: &ProductAnalyticsState,
-        environment: &str,
-        sql: &str,
-    ) -> Vec<serde_json::Value> {
+    async fn query_env(state: &ProductAnalyticsState, sql: &str) -> Vec<serde_json::Value> {
         let env_state = state
-            .get_environment(TEST_API_KEY, environment)
+            .get_environment(TEST_API_KEY)
             .await
-            .expect("environment not found in test state");
+            .expect("API key not found in test state");
         let sql = sql.to_owned();
         tokio::task::spawn_blocking(move || {
             let env = env_state.lock().unwrap();
@@ -681,10 +662,51 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
+    #[tokio::test]
+    async fn analytics_accepts_single_and_batch_payloads_with_or_without_legacy_environment() {
+        for (path, payload) in [
+            (
+                "/track",
+                serde_json::json!({"event":"Signup","distinct_id":"user_1","properties":{}}),
+            ),
+            (
+                "/identify",
+                serde_json::json!({"distinct_id":"user_1","traits":{"plan":"pro"}}),
+            ),
+            (
+                "/alias",
+                serde_json::json!({"distinct_id":"anonymous_1","new_user_id":"user_1"}),
+            ),
+        ] {
+            let mut legacy_payload = payload.clone();
+            legacy_payload["environment"] = serde_json::json!("unknown-environment");
+            for body in [
+                payload.clone(),
+                serde_json::json!([payload]),
+                legacy_payload.clone(),
+                serde_json::json!([legacy_payload]),
+            ] {
+                let response = make_router(make_state())
+                    .oneshot(
+                        Request::builder()
+                            .method(Method::POST)
+                            .uri(path)
+                            .header("X-API-Key", TEST_API_KEY)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(body.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "{path}: {body}");
+            }
+        }
+    }
+
     // ── POST /track ───────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn track_unknown_environment_returns_environment_not_found() {
+    async fn track_ignores_legacy_environment() {
         let (key, val) = api_key_header();
         let app = make_router(make_state());
         let resp = app
@@ -702,19 +724,16 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(resp.status(), StatusCode::OK);
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(
-            body,
-            serde_json::json!({ "ok": false, "error_code": "environment-not-found" })
-        );
+        assert_eq!(body, serde_json::json!({ "ok": true, "error_code": null }));
     }
 
     #[tokio::test]
-    async fn identify_unknown_environment_returns_environment_not_found() {
+    async fn identify_ignores_legacy_environment() {
         let (key, val) = api_key_header();
         let app = make_router(make_state());
         let resp = app
@@ -732,15 +751,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(resp.status(), StatusCode::OK);
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(
-            body,
-            serde_json::json!({ "ok": false, "error_code": "environment-not-found" })
-        );
+        assert_eq!(body, serde_json::json!({ "ok": true, "error_code": null }));
     }
 
     #[tokio::test]
@@ -819,7 +835,7 @@ mod tests {
             .await
             .unwrap();
 
-        let rows = query_env(&state, "production", "SELECT event FROM events").await;
+        let rows = query_env(&state, "SELECT event FROM events").await;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["event"], "Signup");
     }
@@ -845,7 +861,6 @@ mod tests {
 
         let rows = query_env(
             &state,
-            "prod",
             "SELECT distinct_id FROM identity_distinct_ids WHERE distinct_id = 'user_42'",
         )
         .await;
@@ -874,7 +889,6 @@ mod tests {
 
         let rows = query_env(
             &state,
-            "prod",
             "SELECT identity_uuid FROM events WHERE distinct_id = 'user_99'",
         )
         .await;
@@ -907,7 +921,6 @@ mod tests {
         // Both user_1 and anon_abc should be linked to the same identity
         let rows = query_env(
             &state,
-            "prod",
             "SELECT DISTINCT identity_uuid FROM identity_distinct_ids WHERE distinct_id IN ('user_1', 'anon_abc')",
         )
         .await;
@@ -946,7 +959,6 @@ mod tests {
 
         let rows = query_env(
             &state,
-            "prod",
             "SELECT timestamp FROM events WHERE event = 'TimedEvent'",
         )
         .await;
@@ -984,7 +996,6 @@ mod tests {
 
         let rows = query_env(
             &state,
-            "prod",
             "SELECT timestamp FROM events WHERE event = 'IsoEvent'",
         )
         .await;
@@ -1074,7 +1085,7 @@ mod tests {
             .await
             .unwrap();
 
-        let rows = query_env(&state, "prod", "SELECT is_identified FROM identities").await;
+        let rows = query_env(&state, "SELECT is_identified FROM identities").await;
         assert_eq!(rows.len(), 1);
         // is_identified should be TRUE after identify call
         assert_eq!(rows[0]["is_identified"], "true");
@@ -1117,7 +1128,7 @@ mod tests {
             .await
             .unwrap();
 
-        let rows = query_env(&state, "prod", "SELECT traits FROM identities").await;
+        let rows = query_env(&state, "SELECT traits FROM identities").await;
         assert_eq!(rows.len(), 1);
         let traits_str = rows[0]["traits"].as_str().unwrap();
         let traits: serde_json::Value = serde_json::from_str(traits_str).unwrap();
@@ -1148,7 +1159,7 @@ mod tests {
         }
 
         // Should have exactly one identity row, not three
-        let rows = query_env(&state, "prod", "SELECT uuid FROM identities").await;
+        let rows = query_env(&state, "SELECT uuid FROM identities").await;
         assert_eq!(
             rows.len(),
             1,
@@ -1178,7 +1189,6 @@ mod tests {
 
         let rows = query_env(
             &state,
-            "prod",
             "SELECT DISTINCT identity_uuid FROM identity_distinct_ids WHERE distinct_id IN ('user_1', 'anon_xyz')",
         )
         .await;
@@ -1230,7 +1240,6 @@ mod tests {
 
         let rows = query_env(
             &state,
-            "prod",
             "SELECT identity_traits FROM events WHERE event = 'PageView'",
         )
         .await;
@@ -1282,7 +1291,6 @@ mod tests {
 
         let rows = query_env(
             &state,
-            "prod",
             "SELECT identity_traits FROM events WHERE event = 'Dashboard Loaded'",
         )
         .await;
@@ -1332,7 +1340,6 @@ mod tests {
         // The anonymous event should now have an identity_uuid assigned
         let rows = query_env(
             &state,
-            "prod",
             "SELECT identity_uuid FROM events WHERE anonymous_id = 'anon_1'",
         )
         .await;
@@ -1344,46 +1351,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn environments_are_isolated() {
-        let state = make_state();
-        let (key, val) = api_key_header();
-
-        make_router(state.clone())
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/track")
-                    .header(key, val)
+    async fn api_key_environments_are_isolated() {
+        let other_key = "staging-api-key";
+        let state = ProductAnalyticsState::new(Arc::new(HashSet::from([
+            TEST_API_KEY.to_owned(),
+            other_key.to_owned(),
+        ])));
+        for (api_key, event, legacy_environment) in [
+            (TEST_API_KEY, "ProdEvent", "staging"),
+            (other_key, "StagingEvent", "production"),
+        ] {
+            let response = make_router(state.clone()).oneshot(
+                Request::builder().method(Method::POST).uri("/track")
+                    .header("X-API-Key", api_key)
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        r#"{"event":"ProdEvent","environment":"production","properties":{}}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        make_router(state.clone())
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/track")
-                    .header(key, val)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        r#"{"event":"StagingEvent","environment":"staging","properties":{}}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        let prod_rows = query_env(&state, "production", "SELECT event FROM events").await;
-        let staging_rows = query_env(&state, "staging", "SELECT event FROM events").await;
-
-        assert_eq!(prod_rows.len(), 1);
-        assert_eq!(prod_rows[0]["event"], "ProdEvent");
-        assert_eq!(staging_rows.len(), 1);
-        assert_eq!(staging_rows[0]["event"], "StagingEvent");
+                    .body(Body::from(serde_json::json!({"event":event,"environment":legacy_environment,"properties":{}}).to_string())).unwrap()
+            ).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let environment = state.get_environment(api_key).await.unwrap();
+            let environment = environment.lock().unwrap();
+            let conn = environment.conn.lock().unwrap();
+            let (count, actual): (i64, String) = conn
+                .query_row("SELECT COUNT(*), MIN(event) FROM events", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .unwrap();
+            assert_eq!(count, 1);
+            assert_eq!(actual, event);
+        }
+        let rows = query_env(&state, "SELECT event FROM events").await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["event"], "ProdEvent");
     }
 }
