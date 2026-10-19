@@ -15,7 +15,6 @@ pub enum FlexibleTimestamp {
 #[derive(Debug, Clone, Deserialize)]
 pub struct TrackPayload {
     pub event: String,
-    pub environment: String,
     pub properties: serde_json::Map<String, serde_json::Value>,
     pub distinct_id: Option<String>,
     pub anonymous_id: Option<String>,
@@ -51,7 +50,6 @@ pub struct TrackResponse {
 #[derive(Debug, Clone, Deserialize)]
 pub struct IdentifyPayload {
     pub distinct_id: String,
-    pub environment: String,
     pub anonymous_id: Option<String>,
     pub traits: Option<serde_json::Map<String, serde_json::Value>>,
     #[allow(dead_code)]
@@ -84,7 +82,6 @@ pub struct IdentifyResponse {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AliasPayload {
-    pub environment: String,
     /// The source distinct_id to be merged away.
     pub distinct_id: String,
     /// The target user id that survives the merge.

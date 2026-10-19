@@ -82,20 +82,18 @@ Missing, unknown, or non-scalar parameters return a query error through the usua
 | `--analytics-port` | `-a`  | `ALTERTABLE_MOCK_ANALYTICS_PORT` | `15001`      | Port for the Product Analytics REST (HTTP) server                                                                                                                                           |
 | `--user`           | `-u`  | `ALTERTABLE_MOCK_USERS`          | —            | `username:password` pairs (repeatable, or comma-separated via env var)                                                                                                                      |
 | `--api-key`        | `-k`  | `ALTERTABLE_MOCK_API_KEYS`       | —            | API keys for the Product Analytics server (repeatable, or comma-separated via env var)                                                                                                      |
-| `--environment`    | `-e`  | `ALTERTABLE_MOCK_ENVIRONMENTS`   | `production` | Environment names to pre-create for the Product Analytics server (repeatable, or comma-separated via env var). Requests for unknown environments are rejected with `environment-not-found`. |
 
 **Examples:**
 
 ```bash
 # Custom ports, multiple users and an API key via flags
 altertable-mock --flight-port 9090 --lakehouse-port 9091 --analytics-port 9092 \
-  --user alice:s3cr3t --user bob:hunter2 --api-key myapikey \
-  --environment production --environment staging
+  --user alice:s3cr3t --user bob:hunter2 --api-key myapikey
 
 # Via environment variables
 ALTERTABLE_MOCK_FLIGHT_PORT=9090 ALTERTABLE_MOCK_LAKEHOUSE_PORT=9091 \
   ALTERTABLE_MOCK_ANALYTICS_PORT=9092 ALTERTABLE_MOCK_USERS=alice:s3cr3t,bob:hunter2 \
-  ALTERTABLE_MOCK_API_KEYS=myapikey ALTERTABLE_MOCK_ENVIRONMENTS=production,staging \
+  ALTERTABLE_MOCK_API_KEYS=myapikey \
   altertable-mock
 ```
 
@@ -142,11 +140,10 @@ curl -u alice:secret -X POST http://localhost:15000/query \
 
 ### Product Analytics API — port 15001
 
-Authenticate with an API key passed as either an `X-API-Key` header or an `Authorization: Bearer <token>` header. Each API key + environment combination gets its own isolated in-memory DuckDB database.
+Authenticate with an API key passed as either an `X-API-Key` header or an `Authorization: Bearer <token>` header. Each API key selects its own isolated in-memory DuckDB database.
 
-Environments must be declared at startup via `--environment` (or `ALTERTABLE_MOCK_ENVIRONMENTS`). If no environments are specified, a single `"production"` environment is created automatically. Requests that reference an undeclared environment are rejected with `{"ok": false, "error_code": "environment-not-found"}`.
-
-If the `environment` field is omitted from a request payload, it defaults to `"production"`.
+The API key determines the environment. Legacy payload `environment` fields and
+`--environment` / `ALTERTABLE_MOCK_ENVIRONMENTS` settings are accepted and ignored.
 
 | Method | Path        | Description                                  |
 | ------ | ----------- | -------------------------------------------- |
@@ -154,7 +151,7 @@ If the `environment` field is omitted from a request payload, it defaults to `"p
 | `POST` | `/identify` | Create or update a user identity with traits |
 | `POST` | `/alias`    | Alias an anonymous ID to an identified user  |
 
-Both endpoints accept either a single object or a JSON array of objects.
+All endpoints accept either a single object or a JSON array of objects.
 
 **`POST /track`**
 
@@ -163,7 +160,6 @@ curl -H "X-API-Key: myapikey" -X POST http://localhost:15001/track \
   -H "Content-Type: application/json" \
   -d '{
     "event": "Button Clicked",
-    "environment": "production",
     "properties": {"button": "signup"},
     "distinct_id": "user_42",
     "anonymous_id": "anon_abc",
@@ -174,7 +170,6 @@ curl -H "X-API-Key: myapikey" -X POST http://localhost:15001/track \
 | Field          | Type             | Required | Description                                                        |
 | -------------- | ---------------- | -------- | ------------------------------------------------------------------ |
 | `event`        | string           | yes      | Event name                                                         |
-| `environment`  | string           | no       | Environment name; defaults to `"production"` if omitted            |
 | `properties`   | object           | yes      | Arbitrary event properties                                         |
 | `distinct_id`  | string           | no       | Identified user ID                                                 |
 | `anonymous_id` | string           | no       | Anonymous / device ID (linked to `distinct_id` if both provided)   |
@@ -189,7 +184,6 @@ curl -H "X-API-Key: myapikey" -X POST http://localhost:15001/identify \
   -H "Content-Type: application/json" \
   -d '{
     "distinct_id": "user_42",
-    "environment": "production",
     "traits": {"email": "alice@example.com", "plan": "pro"},
     "anonymous_id": "anon_abc"
   }'
@@ -198,7 +192,6 @@ curl -H "X-API-Key: myapikey" -X POST http://localhost:15001/identify \
 | Field          | Type   | Required | Description                                             |
 | -------------- | ------ | -------- | ------------------------------------------------------- |
 | `distinct_id`  | string | yes      | Identified user ID                                      |
-| `environment`  | string | no       | Environment name; defaults to `"production"` if omitted |
 | `traits`       | object | no       | User traits to shallow-merge into existing traits       |
 | `anonymous_id` | string | no       | Anonymous ID to link to this identity                   |
 
@@ -209,8 +202,7 @@ curl -H "X-API-Key: myapikey" -X POST http://localhost:15001/alias \
   -H "Content-Type: application/json" \
   -d '{
     "distinct_id": "anon_abc",
-    "new_user_id": "user_42",
-    "environment": "production"
+    "new_user_id": "user_42"
   }'
 ```
 
@@ -218,7 +210,6 @@ curl -H "X-API-Key: myapikey" -X POST http://localhost:15001/alias \
 | ------------- | ------ | -------- | ------------------------------------------------------- |
 | `distinct_id` | string | yes      | The source ID to be merged away                         |
 | `new_user_id` | string | yes      | The target ID that survives the merge                   |
-| `environment` | string | no       | Environment name; defaults to `"production"` if omitted |
 
 All endpoints return `{"ok": true}` on success or `{"ok": false, "error_code": "..."}` on failure.
 

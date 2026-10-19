@@ -68,8 +68,8 @@ impl EnvironmentState {
     }
 }
 
-/// Key: (api_key, environment_name)
-pub type EnvironmentStore = Arc<RwLock<HashMap<(String, String), Arc<Mutex<EnvironmentState>>>>>;
+/// Each API key owns one isolated analytics environment.
+pub type EnvironmentStore = Arc<RwLock<HashMap<String, Arc<Mutex<EnvironmentState>>>>>;
 
 #[derive(Clone)]
 pub struct ProductAnalyticsState {
@@ -78,28 +78,16 @@ pub struct ProductAnalyticsState {
 }
 
 impl ProductAnalyticsState {
-    /// Create state pre-seeded with the given environment names. If `environments` is empty,
-    /// a single `"production"` environment is created for every API key.
-    ///
-    /// Because environments are keyed per API key and the set of keys is fixed at startup,
-    /// we create one `EnvironmentState` per (api_key, environment) pair up front.
-    pub fn with_environments(
-        allowed_api_keys: Arc<std::collections::HashSet<String>>,
-        environments: &[String],
-    ) -> Self {
-        let env_names: Vec<&str> = if environments.is_empty() {
-            vec!["production"]
-        } else {
-            environments.iter().map(|s| s.as_str()).collect()
-        };
-
-        let mut store = HashMap::new();
-        for api_key in allowed_api_keys.iter() {
-            for env_name in &env_names {
-                let key = (api_key.clone(), (*env_name).to_owned());
-                store.insert(key, Arc::new(Mutex::new(EnvironmentState::new())));
-            }
-        }
+    pub fn new(allowed_api_keys: Arc<std::collections::HashSet<String>>) -> Self {
+        let store = allowed_api_keys
+            .iter()
+            .map(|api_key| {
+                (
+                    api_key.clone(),
+                    Arc::new(Mutex::new(EnvironmentState::new())),
+                )
+            })
+            .collect();
 
         Self {
             environment_store: Arc::new(RwLock::new(store)),
@@ -107,14 +95,9 @@ impl ProductAnalyticsState {
         }
     }
 
-    pub async fn get_environment(
-        &self,
-        username: &str,
-        environment: &str,
-    ) -> Option<Arc<Mutex<EnvironmentState>>> {
-        let key = (username.to_owned(), environment.to_owned());
+    pub async fn get_environment(&self, api_key: &str) -> Option<Arc<Mutex<EnvironmentState>>> {
         let store = self.environment_store.read().await;
-        store.get(&key).cloned()
+        store.get(api_key).cloned()
     }
 }
 
