@@ -31,3 +31,6 @@ Thumbs.db
 # Logs
 *.log
 
+
+# Black-box tests run against the image, not inside it
+e2e/

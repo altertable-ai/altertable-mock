@@ -38,24 +38,23 @@ RUN ldconfig
 COPY --from=builder /app/target/release/altertable-mock /usr/local/bin/altertable-mock
 
 # Install DuckLake and semantic_layer for the linked DuckDB version into the default extension directory.
+# The DuckDB CLI installs them so it also writes the `.info` files: without one recording the
+# community repository, DuckDB rejects semantic_layer's community signature on LOAD.
 RUN set -eu; \
     case "${TARGETARCH:-}" in \
-      amd64) platform=linux_amd64 ;; \
-      arm64) platform=linux_arm64 ;; \
+      amd64|arm64) arch="${TARGETARCH}" ;; \
       "") \
         case "$(uname -m)" in \
-          x86_64) platform=linux_amd64 ;; \
-          aarch64|arm64) platform=linux_arm64 ;; \
+          x86_64) arch=amd64 ;; \
+          aarch64|arm64) arch=arm64 ;; \
           *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;; \
         esac ;; \
       *) echo "unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;; \
     esac; \
-    dir="/root/.duckdb/extensions/v2.0.0/${platform}"; \
-    mkdir -p "$dir"; \
-    curl -fsSL "http://extensions.duckdb.org/v2.0.0/${platform}/ducklake.duckdb_extension.gz" \
-      | gzip -dc > "$dir/ducklake.duckdb_extension"; \
-    curl -fsSL "http://community-extensions.duckdb.org/v2.0.0/${platform}/semantic_layer.duckdb_extension.gz" \
-      | gzip -dc > "$dir/semantic_layer.duckdb_extension"
+    curl -fsSL "https://github.com/duckdb/duckdb/releases/download/v2.0.0/duckdb-cli-linux-${arch}.tar.gz" \
+      | tar -xz -C /tmp duckdb; \
+    /tmp/duckdb -c "INSTALL ducklake; INSTALL semantic_layer FROM community;"; \
+    rm /tmp/duckdb
 
 EXPOSE 15000
 EXPOSE 15002

@@ -220,3 +220,25 @@ The build links stock DuckDB 2.0.0, downloaded from the version pinned by `duckd
 ```bash
 cargo build --release
 ```
+
+## End-to-end tests
+
+The [`e2e`](e2e) crate tests the Docker image the way its users run it. It builds the repository's `Dockerfile` with `docker build`, starts containers with [testcontainers](https://github.com/testcontainers/testcontainers-rs), and talks to them only over the published ports. It needs a running Docker daemon:
+
+```bash
+cargo test --manifest-path e2e/Cargo.toml
+```
+
+The first run builds the image from scratch; later runs reuse Docker's layer cache. Set `ALTERTABLE_MOCK_IMAGE` to test an existing image instead, such as `ghcr.io/altertable-ai/altertable-mock:latest`.
+
+Lakehouse queries are golden files in [`e2e/cases/lakehouse`](e2e/cases/lakehouse). Each file runs as its own user, so files never share tables. A case is the SQL sent to `POST /query` and every response line after the header (the column line, then the rows or the error):
+
+```text
+query {"params": {"value": 42}}
+SELECT $value AS answer
+----
+[{"name":"answer","type":"BIGINT"}]
+[42]
+```
+
+`statement ok` runs setup SQL and only checks that it succeeds. A JSON object after the directive is merged into the request body. To write or refresh the expected output, run the tests with `E2E_BLESS=1` and review the diff.

@@ -1,0 +1,24 @@
+# Extensions the image ships with must load without network access.
+
+query
+SELECT extension_name, loaded FROM duckdb_extensions() WHERE extension_name IN ('ducklake', 'semantic_layer') ORDER BY extension_name
+----
+[{"name":"extension_name","type":"VARCHAR"},{"name":"loaded","type":"BOOLEAN"}]
+["ducklake",true]
+["semantic_layer",true]
+
+statement ok
+CREATE TABLE sales_orders (region VARCHAR, amount INTEGER)
+
+statement ok
+INSERT INTO sales_orders VALUES ('US', 100), ('US', 50), ('EU', 40)
+
+statement ok
+CREATE SEMANTIC VIEW sales TABLES (sales_orders AS sales_orders) DIMENSIONS (sales_orders.region AS region) METRICS (sales_orders.revenue AS SUM(sales_orders.amount))
+
+query
+SELECT region, revenue FROM SEMANTIC_VIEW(sales DIMENSIONS sales_orders.region METRICS sales_orders.revenue) ORDER BY region
+----
+[{"name":"region","type":"VARCHAR"},{"name":"revenue","type":"DECIMAL(38, 0)"}]
+["EU",40]
+["US",150]

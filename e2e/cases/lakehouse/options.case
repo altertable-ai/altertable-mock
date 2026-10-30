@@ -1,0 +1,52 @@
+# Request options other than `statement`.
+
+query {"params": {"name": "Ada", "year": 1815, "ratio": 0.5, "alive": false}}
+SELECT $name AS name, $year AS year, $ratio AS ratio, $alive AS alive
+----
+[{"name":"name","type":"VARCHAR"},{"name":"year","type":"BIGINT"},{"name":"ratio","type":"DOUBLE"},{"name":"alive","type":"BOOLEAN"}]
+["Ada",1815,0.5,false]
+
+# A null parameter binds an untyped NULL.
+query {"params": {"nothing": null}}
+SELECT $nothing AS nothing
+----
+[{"name":"nothing","type":"NULL"}]
+[null]
+
+query {"limit": 2}
+SELECT * FROM range(10) AS t(i)
+----
+[{"name":"i","type":"BIGINT"}]
+[0]
+[1]
+
+query {"limit": 2, "offset": 5}
+SELECT * FROM range(10) AS t(i)
+----
+[{"name":"i","type":"BIGINT"}]
+[5]
+[6]
+
+statement ok
+CREATE SCHEMA analytics
+
+statement ok
+CREATE TABLE analytics.events AS SELECT 'signup' AS name
+
+# `schema` selects the schema unqualified names resolve against.
+query {"catalog": "memory", "schema": "analytics"}
+SELECT * FROM events
+----
+[{"name":"name","type":"VARCHAR"}]
+["signup"]
+
+# Missing and unknown parameters fail like any other query error.
+query {"params": {}}
+SELECT $missing AS value
+----
+{"error":"Missing query parameter: missing"}
+
+query {"params": {"value": 1, "extra": 2}}
+SELECT $value AS value
+----
+{"error":"Unknown query parameters"}

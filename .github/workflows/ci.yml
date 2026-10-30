@@ -51,3 +51,55 @@ jobs:
 
       - name: Test
         run: cargo test --all-targets
+
+  e2e:
+    name: End-to-end tests (Docker image)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: altertable-mock:latest
+          # Reuse the layers the Docker publish workflow caches for this platform.
+          cache-from: type=gha,scope=linux/amd64
+          provenance: false
+          sbom: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache e2e build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            e2e/target
+          key: cargo-e2e-${{ runner.os }}-${{ hashFiles('e2e/Cargo.lock') }}
+          restore-keys: |
+            cargo-e2e-${{ runner.os }}-
+
+      - name: Lint
+        working-directory: e2e
+        run: |
+          cargo fmt -- --check
+          cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        working-directory: e2e
+        # Test the image built above with the GitHub Actions layer cache instead of letting the
+        # harness rebuild it from scratch.
+        env:
+          ALTERTABLE_MOCK_IMAGE: altertable-mock:latest
+        run: cargo test --locked
