@@ -1,0 +1,65 @@
+# Table lifecycle in the user's DuckLake (catalog `memory`, schema `main`).
+
+statement ok
+CREATE TABLE users (id INTEGER NOT NULL, name VARCHAR NOT NULL, country VARCHAR)
+
+query
+INSERT INTO users VALUES (1, 'Ada', 'UK'), (2, 'Grace', 'US'), (3, 'Linus', 'FI'), (4, 'Ken', 'US')
+----
+[{"name":"Count","type":"BIGINT"}]
+[4]
+
+query
+SELECT * FROM users ORDER BY id
+----
+[{"name":"id","type":"INTEGER"},{"name":"name","type":"VARCHAR"},{"name":"country","type":"VARCHAR"}]
+[1,"Ada","UK"]
+[2,"Grace","US"]
+[3,"Linus","FI"]
+[4,"Ken","US"]
+
+query
+SELECT country, count(*) AS users FROM users GROUP BY country ORDER BY users DESC, country
+----
+[{"name":"country","type":"VARCHAR"},{"name":"users","type":"BIGINT"}]
+["US",2]
+["FI",1]
+["UK",1]
+
+query
+UPDATE users SET country = 'UK' WHERE id = 3
+----
+[{"name":"Count","type":"BIGINT"}]
+[1]
+
+query
+DELETE FROM users WHERE country = 'US'
+----
+[{"name":"Count","type":"BIGINT"}]
+[2]
+
+query
+SELECT id, name FROM memory.main.users ORDER BY id
+----
+[{"name":"id","type":"INTEGER"},{"name":"name","type":"VARCHAR"}]
+[1,"Ada"]
+[3,"Linus"]
+
+statement ok
+CREATE TABLE orders AS SELECT * FROM (VALUES (1, 1, 10.5), (2, 1, 4.5), (3, 3, 7.0)) AS t(id, user_id, amount)
+
+query
+SELECT u.name, sum(o.amount) AS spent FROM users u JOIN orders o ON o.user_id = u.id GROUP BY u.name ORDER BY u.name
+----
+[{"name":"name","type":"VARCHAR"},{"name":"spent","type":"DECIMAL(38, 1)"}]
+["Ada",15.0]
+["Linus",7.0]
+
+statement ok
+DROP TABLE orders
+
+query
+SELECT table_name FROM information_schema.tables WHERE table_catalog = 'memory' ORDER BY table_name
+----
+[{"name":"table_name","type":"VARCHAR"}]
+["users"]

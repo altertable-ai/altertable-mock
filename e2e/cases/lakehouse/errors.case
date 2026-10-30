@@ -1,0 +1,30 @@
+# Failing statements answer HTTP 200 with an `error` line after the header.
+
+query
+SELECT * FROM does_not_exist
+----
+{"error":"Failed to prepare statement: Catalog Error: Table with name does_not_exist does not exist!\nDid you mean \"pg_settings\"?\n\nLINE 1: SELECT * FROM does_not_exist\n                      ^^^^^^^^^^^^^^"}
+
+query
+SELEC 1
+----
+{"error":"Failed to prepare statement: Parser Error: syntax error at or near \"SELEC\"\n\nLINE 1: SELEC 1\n        ^^^^^"}
+
+query
+SELECT 1 / 0::INTEGER AS ok, 'a'::INTEGER AS boom
+----
+{"error":"Failed to execute query: Conversion Error: Could not convert string 'a' to INT32\n\nLINE 1: SELECT 1 / 0::INTEGER AS ok, 'a'::INTEGER AS boom\n                                        ^^^^^^^^^"}
+
+# DuckLake has no PRIMARY KEY or UNIQUE constraints.
+query
+CREATE TABLE unique_ids (id INTEGER PRIMARY KEY)
+----
+{"error":"Failed to execute query: Not implemented Error: PRIMARY KEY/UNIQUE constraints are not supported in DuckLake"}
+
+statement ok
+CREATE TABLE required (id INTEGER NOT NULL)
+
+query
+INSERT INTO required VALUES (1), (NULL)
+----
+{"error":"Failed to execute query: Constraint Error: NOT NULL constraint failed: required.id"}

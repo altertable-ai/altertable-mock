@@ -1,0 +1,57 @@
+# How each DuckDB type is encoded in the default NDJSON response.
+
+query
+SELECT 1::TINYINT AS tiny, 1::SMALLINT AS small, 1::INTEGER AS int, 1::BIGINT AS big, 1::HUGEINT AS huge, 1::UBIGINT AS ubig
+----
+[{"name":"tiny","type":"TINYINT"},{"name":"small","type":"SMALLINT"},{"name":"int","type":"INTEGER"},{"name":"big","type":"BIGINT"},{"name":"huge","type":"DECIMAL(38, 0)"},{"name":"ubig","type":"UBIGINT"}]
+[1,1,1,1,1,1]
+
+query
+SELECT 1.5::FLOAT AS f, 1.5::DOUBLE AS d, 123.45::DECIMAL(10, 2) AS dec
+----
+[{"name":"f","type":"FLOAT"},{"name":"d","type":"DOUBLE"},{"name":"dec","type":"DECIMAL(10, 2)"}]
+[1.5,1.5,123.45]
+
+query
+SELECT 'text'::VARCHAR AS s, true AS b, '\x00\xFF'::BLOB AS blob, '6c1d5d5c-5f2b-4b1a-9a0b-1c2d3e4f5a6b'::UUID AS id
+----
+[{"name":"s","type":"VARCHAR"},{"name":"b","type":"BOOLEAN"},{"name":"blob","type":"BLOB"},{"name":"id","type":"VARCHAR"}]
+["text",true,"00ff","6c1d5d5c-5f2b-4b1a-9a0b-1c2d3e4f5a6b"]
+
+query
+SELECT DATE '2024-02-29' AS d, TIME '13:45:00' AS t, TIMESTAMP '2024-02-29 13:45:00.123456' AS ts, TIMESTAMPTZ '2024-02-29 13:45:00+00' AS tstz, INTERVAL 90 MINUTE AS i
+----
+[{"name":"d","type":"DATE"},{"name":"t","type":"TIME"},{"name":"ts","type":"TIMESTAMP"},{"name":"tstz","type":"TIMESTAMP WITH TIME ZONE"},{"name":"i","type":"INTERVAL"}]
+["2024-02-29","13:45:00","2024-02-29T13:45:00.123456","2024-02-29T13:45:00Z","1 hours 30 mins"]
+
+query
+SELECT [1, 2, 3] AS list, {'a': 1, 'b': 'x'} AS struct, MAP {'k': 'v'} AS map
+----
+[{"name":"list","type":"LIST"},{"name":"struct","type":"STRUCT(a INTEGER, b VARCHAR)"},{"name":"map","type":"MAP"}]
+[[1,2,3],[1,"x"],{"k":"v"}]
+
+query
+SELECT '{"a": [1, 2], "b": null}'::JSON AS j
+----
+[{"name":"j","type":"JSON"}]
+[{"a":[1,2],"b":null}]
+
+query
+SELECT NULL::INTEGER AS n, NULL::VARCHAR AS s, [NULL, 1] AS l
+----
+[{"name":"n","type":"INTEGER"},{"name":"s","type":"VARCHAR"},{"name":"l","type":"LIST"}]
+[null,null,[null,1]]
+
+# An untyped NULL has DuckDB's NULL type.
+query
+SELECT NULL AS untyped
+----
+[{"name":"untyped","type":"NULL"}]
+[null]
+
+# Decimals keep every digit, even beyond f64 precision.
+query
+SELECT 12345678901234567890.12::DECIMAL(38, 2) AS wide
+----
+[{"name":"wide","type":"DECIMAL(38, 2)"}]
+[12345678901234567890.12]

@@ -1,13 +1,14 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_array::cast::AsArray;
 use arrow_csv::WriterBuilder as CsvWriterBuilder;
 use arrow_schema::extension::{EXTENSION_TYPE_NAME_KEY, ExtensionType, Json};
-use arrow_schema::{Field, Schema, SchemaRef};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use duckdb::core::{LogicalTypeHandle, LogicalTypeId};
 use parquet::arrow::ArrowWriter;
-use serde_json::{Map, Value};
+use serde_json::value::{RawValue, to_raw_value};
 
 pub(crate) const ALTERTABLE_ORIGINAL_TYPE_METADATA_KEY: &str = "altertable.original_type";
 pub(crate) const ALTERTABLE_ORIGINAL_TYPE_JSON: &str = "JSON";
@@ -75,6 +76,12 @@ pub fn arrow_type_to_string(field: &Field) -> anyhow::Result<String> {
 
     if field_is_json_utf8(field) {
         return Ok(ALTERTABLE_ORIGINAL_TYPE_JSON.to_owned());
+    }
+
+    // DuckDB exports an untyped NULL (`SELECT NULL`) as Arrow's Null type, which has no
+    // logical type to convert back to.
+    if field.data_type() == &DataType::Null {
+        return Ok("NULL".to_owned());
     }
 
     let logical_type = duckdb::vtab::to_duckdb_logical_type(field.data_type())
@@ -160,7 +167,8 @@ pub fn record_batch_to_jsonl(batch: &RecordBatch) -> anyhow::Result<Vec<u8>> {
     let mut buf = Vec::new();
 
     for row in 0..batch.num_rows() {
-        let mut object = Map::with_capacity(batch.num_columns());
+        // Sorted keys, as the `serde_json::Map` this replaced wrote them.
+        let mut object = BTreeMap::new();
         for (column_index, field) in schema.fields().iter().enumerate() {
             let value = array_value_to_json(batch.column(column_index).as_ref(), row, field)?;
             object.insert(field.name().clone(), value);
@@ -189,7 +197,9 @@ pub fn record_batches_to_parquet(
         .map_err(|e| anyhow::anyhow!("failed to finish Parquet export: {e}"))
 }
 
-pub fn record_batch_to_default_rows(batch: &RecordBatch) -> anyhow::Result<Vec<Vec<Value>>> {
+pub fn record_batch_to_default_rows(
+    batch: &RecordBatch,
+) -> anyhow::Result<Vec<Vec<Box<RawValue>>>> {
     let schema = batch.schema();
     let mut rows = Vec::with_capacity(batch.num_rows());
 
@@ -208,20 +218,24 @@ pub fn record_batch_to_default_rows(batch: &RecordBatch) -> anyhow::Result<Vec<V
     Ok(rows)
 }
 
+/// Encodes one cell as raw JSON text.
+///
+/// Parsing it into a `serde_json::Value` would round numbers through `f64` and drop the
+/// trailing digits of wide decimals and 64-bit integers.
 fn array_value_to_json(
     array: &dyn arrow_array::Array,
     row: usize,
     field: &Field,
-) -> anyhow::Result<Value> {
+) -> anyhow::Result<Box<RawValue>> {
     if array.is_null(row) {
-        return Ok(Value::Null);
+        return Ok(to_raw_value(&())?);
     }
 
     if field_is_json_utf8(field) {
         let json = array.as_string::<i32>().value(row);
-        return match serde_json::from_str(json) {
-            Ok(value) => Ok(value),
-            Err(_) => Ok(Value::String(json.to_owned())),
+        return match serde_json::from_str::<serde_json::Value>(json) {
+            Ok(value) => Ok(to_raw_value(&value)?),
+            Err(_) => Ok(to_raw_value(json)?),
         };
     }
 
@@ -241,7 +255,7 @@ fn array_value_to_json(
     let line = std::str::from_utf8(&buf)
         .map_err(|e| anyhow::anyhow!("JSON export output was not UTF-8: {e}"))?
         .trim();
-    let row_values: Vec<Value> = serde_json::from_str(line)
+    let row_values: Vec<Box<RawValue>> = serde_json::from_str(line)
         .map_err(|e| anyhow::anyhow!("failed to parse JSON export row: {e}"))?;
     row_values
         .into_iter()
@@ -252,7 +266,7 @@ fn array_value_to_json(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::StringArray;
+    use arrow_array::{Decimal128Array, StringArray};
     use arrow_schema::DataType;
 
     #[test]
@@ -294,6 +308,33 @@ mod tests {
         .unwrap();
 
         let rows = record_batch_to_default_rows(&batch).unwrap();
-        assert_eq!(rows[0][0], serde_json::json!({"a": 1}));
+        assert_eq!(serde_json::to_string(&rows[0]).unwrap(), r#"[{"a":1}]"#);
+    }
+
+    #[test]
+    fn names_untyped_null_columns() {
+        let field = Field::new("untyped", DataType::Null, true);
+        assert_eq!(arrow_type_to_string(&field).unwrap(), "NULL");
+    }
+
+    #[test]
+    fn keeps_every_digit_of_wide_decimals() {
+        let field = Field::new("wide", DataType::Decimal128(38, 2), true);
+        let values = Decimal128Array::from(vec![Some(1_234_567_890_123_456_789_012), None])
+            .with_precision_and_scale(38, 2)
+            .unwrap();
+        let batch =
+            RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![Arc::new(values)])
+                .unwrap();
+
+        let rows = record_batch_to_default_rows(&batch).unwrap();
+        assert_eq!(
+            serde_json::to_string(&rows).unwrap(),
+            "[[12345678901234567890.12],[null]]"
+        );
+        assert_eq!(
+            String::from_utf8(record_batch_to_jsonl(&batch).unwrap()).unwrap(),
+            "{\"wide\":12345678901234567890.12}\n{\"wide\":null}\n"
+        );
     }
 }

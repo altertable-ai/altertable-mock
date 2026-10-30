@@ -1,0 +1,23 @@
+[package]
+name = "altertable-mock-e2e"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Black-box tests that drive the altertable-mock Docker image over the wire"
+
+# Standalone on purpose: the tests only see what the image exposes, and editing them
+# never invalidates the image's build cache.
+[workspace]
+
+[dependencies]
+arrow-array = "58"
+arrow-cast = { version = "58", features = ["prettyprint"] }
+arrow-flight = { version = "58", features = ["flight-sql"] }
+base64 = "0.22.1"
+futures = "0.3.31"
+# Compares numbers digit for digit instead of as f64.
+serde_json = { version = "1.0", features = ["arbitrary_precision"] }
+testcontainers = { version = "0.28", features = ["blocking"] }
+tokio = { version = "1.43.1", features = ["rt-multi-thread", "time"] }
+tonic = "0.14"
+ureq = { version = "3", default-features = false }
