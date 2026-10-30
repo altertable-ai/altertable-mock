@@ -81,6 +81,6 @@ mod tests {
             .unwrap()
             .map(|row| row.unwrap())
             .collect();
-        assert_eq!(rows, vec![("EU".to_string(), 40), ("US".to_string(), 150)]);
+        assert_eq!(rows, vec![("EU".to_owned(), 40), ("US".to_owned(), 150)]);
     }
 }
