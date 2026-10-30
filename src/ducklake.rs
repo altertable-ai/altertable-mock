@@ -70,7 +70,8 @@ pub fn open() -> anyhow::Result<(Connection, DataDir)> {
 }
 
 fn attach(connection: &Connection, data_path: &Path) -> anyhow::Result<()> {
-    load_ducklake(connection)?;
+    crate::extensions::load_ducklake(connection)?;
+    crate::extensions::load_semantic_layer(connection)?;
 
     let catalog = escape_identifier(MEMORY_DB);
     let data_path = escape_literal(&data_path.to_string_lossy());
@@ -80,13 +81,6 @@ fn attach(connection: &Connection, data_path: &Path) -> anyhow::Result<()> {
              USE \"{catalog}\";"
         ))
         .context("failed to attach in-memory DuckLake")?;
-    Ok(())
-}
-
-fn load_ducklake(connection: &Connection) -> anyhow::Result<()> {
-    connection
-        .execute_batch("LOAD ducklake;")
-        .context("failed to load the DuckLake extension (run `INSTALL ducklake;` first)")?;
     Ok(())
 }
 

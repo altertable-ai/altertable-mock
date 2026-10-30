@@ -2373,7 +2373,7 @@ mod tests {
                 .as_str()
                 .is_some_and(|name| name.ends_with("events"))
         );
-        assert_eq!(result["tables"][0]["filters"], "id>50");
+        assert_eq!(result["tables"][0]["filters"], "(id > 50)");
         assert!(result["tables"][0]["estimated_rows"].as_u64().unwrap() > 0);
     }
 

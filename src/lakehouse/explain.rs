@@ -149,6 +149,6 @@ mod tests {
 
         assert_eq!(scans.len(), 1);
         assert!(scans[0].table_name.ends_with("events"));
-        assert_eq!(scans[0].filters.as_deref(), Some("id>50"));
+        assert_eq!(scans[0].filters.as_deref(), Some("(id > 50)"));
     }
 }
