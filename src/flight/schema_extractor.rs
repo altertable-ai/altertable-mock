@@ -1,7 +1,5 @@
 use std::{ffi::CString, ptr, sync::Arc};
 
-use std::sync::Mutex;
-
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use duckdb::ffi::{
     DUCKDB_TYPE, DUCKDB_TYPE_DUCKDB_TYPE_BIGINT, DUCKDB_TYPE_DUCKDB_TYPE_BLOB,
@@ -36,30 +34,13 @@ impl Drop for PreparedStatementGuard {
     }
 }
 
-// duckdb-rs 1.10505 removed `Connection::raw_connection`. `InterruptHandle` still
-// stores that same `duckdb_connection`, and its only field is the mutex around it.
-fn raw_connection(conn: &duckdb::Connection) -> duckdb::ffi::duckdb_connection {
-    struct InterruptHandleLayout {
-        conn: Mutex<duckdb::ffi::duckdb_connection>,
-    }
-
-    let handle = conn.interrupt_handle();
-    unsafe {
-        let layout = &*std::sync::Arc::as_ptr(&handle).cast::<InterruptHandleLayout>();
-        *layout
-            .conn
-            .lock()
-            .expect("DuckDB interrupt handle lock poisoned")
-    }
-}
-
 // Since `duckdb::Statement` does not provide a way to get the schema without executing the statement,
 // we need to use the low-level FFI API
 pub fn extract_schema(conn: &duckdb::Connection, sql: &str) -> anyhow::Result<Schema> {
     let c_sql = CString::new(sql).map_err(|e| anyhow::anyhow!("Invalid SQL: {e}"))?;
 
     unsafe {
-        let raw_conn = raw_connection(conn);
+        let raw_conn = conn.raw_connection();
 
         let mut prep: duckdb_prepared_statement = ptr::null_mut();
         let _guard = PreparedStatementGuard { stmt: &mut prep };
@@ -106,7 +87,7 @@ pub fn extract_parameter_schema(
     let c_sql = CString::new(sql).map_err(|e| anyhow::anyhow!("Invalid SQL: {e}"))?;
 
     unsafe {
-        let raw_conn = raw_connection(conn);
+        let raw_conn = conn.raw_connection();
 
         let mut prep: duckdb_prepared_statement = ptr::null_mut();
         let _guard = PreparedStatementGuard { stmt: &mut prep };

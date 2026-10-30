@@ -4,7 +4,7 @@
 [![GHCR](https://img.shields.io/badge/ghcr.io-altertable--mock-blue?logo=github)](https://github.com/altertable-ai/altertable-mock/pkgs/container/altertable-mock)
 [![CI](https://github.com/altertable-ai/altertable-mock/actions/workflows/ci.yml/badge.svg)](https://github.com/altertable-ai/altertable-mock/actions/workflows/ci.yml)
 
-A mock server that implements the full [Altertable](https://altertable.ai) API surface — [Arrow Flight SQL](https://arrow.apache.org/docs/format/FlightSql.html) (gRPC), Lakehouse REST, and Product Analytics REST — backed by [DuckLake](https://ducklake.select) on DuckDB 1.5.5. Intended for local development and testing.
+A mock server that implements the full [Altertable](https://altertable.ai) API surface — [Arrow Flight SQL](https://arrow.apache.org/docs/format/FlightSql.html) (gRPC), Lakehouse REST, and Product Analytics REST — backed by [DuckLake](https://ducklake.select) on DuckDB 2.0.0. Intended for local development and testing.
 
 ## What it is
 
@@ -215,7 +215,7 @@ All endpoints return `{"ok": true}` on success or `{"ok": false, "error_code": "
 
 ## Building from source
 
-The build links DuckDB 1.5.5: set `DUCKDB_DOWNLOAD_LIB=1` to download it, or point `DUCKDB_LIB_DIR` at a local copy. Lakehouse connections run `LOAD ducklake`, so the extension must already be installed for DuckDB 1.5.5 (`INSTALL ducklake;`). The Docker image installs it at build time.
+The build links stock DuckDB 2.0.0, downloaded from the version pinned by `duckdb-rs`. Set `DUCKDB_LIB_DIR` to link a local copy instead. Lakehouse connections install and load `ducklake` (`INSTALL ducklake; LOAD ducklake;`) and the [`semantic_layer`](https://duckdb.org/community_extensions/extensions/semantic_layer) community extension (`INSTALL semantic_layer FROM community; LOAD semantic_layer;`). The Docker image downloads both extensions first, so `INSTALL` finds them already present and `LOAD` succeeds.
 
 ```bash
 cargo build --release

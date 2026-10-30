@@ -1,5 +1,6 @@
 mod compute_size;
 mod ducklake;
+mod extensions;
 mod flight;
 mod lakehouse;
 mod product_analytics;
