@@ -11,7 +11,10 @@ RUN apt-get update && apt-get -y install --no-install-recommends \
 
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-RUN cargo build --release --locked
+# duckdb-rs caches the shared library under target/duckdb-download, not target/release/deps.
+RUN cargo build --release --locked \
+ && find target/duckdb-download -type f -name libduckdb.so -exec cp {} /tmp/libduckdb.so \; \
+ && test -s /tmp/libduckdb.so
 
 FROM debian:bookworm-slim
 
@@ -29,7 +32,7 @@ RUN apt-get update && apt-get -y install --no-install-recommends \
     gzip \
     && apt-get autoclean && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/target/release/deps/libduckdb.so /usr/local/lib/libduckdb.so
+COPY --from=builder /tmp/libduckdb.so /usr/local/lib/libduckdb.so
 RUN ldconfig
 
 COPY --from=builder /app/target/release/altertable-mock /usr/local/bin/altertable-mock
