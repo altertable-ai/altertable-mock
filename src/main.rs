@@ -171,9 +171,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let listener = tokio::net::TcpListener::bind(analytics_addr)
             .await
             .expect("Failed to bind analytics port");
-        axum::serve(listener, analytics_router)
-            .await
-            .expect("Product Analytics HTTP server failed");
+        axum::serve(
+            listener,
+            analytics_router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .expect("Product Analytics HTTP server failed");
     });
 
     tokio::try_join!(

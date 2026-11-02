@@ -1,4 +1,11 @@
-use axum::{Extension, extract::State, http::StatusCode, response::IntoResponse};
+use std::net::SocketAddr;
+
+use axum::{
+    Extension,
+    extract::{ConnectInfo, State},
+    http::{HeaderMap, StatusCode},
+    response::IntoResponse,
+};
 use chrono::Utc;
 use duckdb::params;
 use tracing::warn;
@@ -6,9 +13,10 @@ use tracing::warn;
 use crate::product_analytics::auth::ApiKey;
 
 use super::{
+    privacy,
     state::{EnvironmentState, ProductAnalyticsState, new_uuid},
     types::{
-        AliasRequest, AliasResponse, IdentifyPayload, IdentifyRequest, IdentifyResponse,
+        AliasRequest, AliasResponse, EventMode, IdentifyPayload, IdentifyRequest, IdentifyResponse,
         TrackPayload, TrackRequest, TrackResponse,
     },
 };
@@ -18,11 +26,49 @@ use super::{
 pub async fn post_track(
     State(state): State<ProductAnalyticsState>,
     Extension(api_key): Extension<ApiKey>,
+    connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
     axum::Json(req): axum::Json<TrackRequest>,
 ) -> impl IntoResponse {
     let payloads = req.into_vec();
 
-    for payload in payloads {
+    // Validate the whole batch up front so a rejected audience event doesn't
+    // leave the preceding events of the batch inserted.
+    if payloads.iter().any(|payload| {
+        payload.mode == EventMode::Audience
+            && [
+                &payload.distinct_id,
+                &payload.anonymous_id,
+                &payload.session_id,
+                &payload.device_id,
+            ]
+            .iter()
+            .any(|id| id.is_some())
+    }) {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(TrackResponse {
+                ok: false,
+                error_code: Some("audience-identity-not-allowed".to_owned()),
+            }),
+        );
+    }
+
+    let client_ip = privacy::client_ip(&headers, connect_info.map(|Extension(c)| c.0));
+
+    for mut payload in payloads {
+        if payload.mode == EventMode::Audience {
+            payload.distinct_id = Some(privacy::visitor_id(
+                &state.audience_salts,
+                &api_key.0,
+                &payload.properties,
+                &headers,
+                client_ip,
+                Utc::now(),
+            ));
+            privacy::strip_sensitive_properties(&mut payload.properties);
+        }
+
         let Some(env_state) = state.get_environment(&api_key.0).await else {
             return (
                 StatusCode::UNAUTHORIZED,
@@ -228,8 +274,8 @@ fn insert_event(env: &EnvironmentState, payload: &TrackPayload) -> Result<(), an
 
     let conn = env.conn.lock().unwrap();
     conn.execute(
-        "INSERT INTO events (uuid, timestamp, event, properties, distinct_id, anonymous_id, device_id, session_id, identity_uuid, identity_traits)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO events (uuid, timestamp, event, properties, distinct_id, anonymous_id, device_id, session_id, identity_uuid, identity_traits, mode)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         params![
             event_uuid,
             timestamp,
@@ -241,6 +287,7 @@ fn insert_event(env: &EnvironmentState, payload: &TrackPayload) -> Result<(), an
             payload.session_id,
             identity_uuid,
             identity_traits_json,
+            payload.mode.as_str(),
         ],
     )?;
 
@@ -1347,6 +1394,177 @@ mod tests {
         assert!(
             !rows[0]["identity_uuid"].is_null(),
             "anonymous event should be back-filled with identity_uuid after identify"
+        );
+    }
+
+    // ── audience mode ─────────────────────────────────────────────────────────
+
+    async fn track_with_headers(
+        state: &ProductAnalyticsState,
+        body: &serde_json::Value,
+        headers: &[(&str, &str)],
+    ) -> StatusCode {
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri("/track")
+            .header("X-API-Key", TEST_API_KEY)
+            .header(header::CONTENT_TYPE, "application/json");
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        make_router(state.clone())
+            .oneshot(request.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn audience_events_get_hashed_distinct_id_and_stripped_properties() {
+        let state = make_state();
+        let payload = serde_json::json!({
+            "event": "$pageview", "mode": "audience",
+            "properties": {"$url": "https://example.com/docs", "$ip": "1.2.3.4",
+                "$country": "FR", "$city": "Paris", "$user_agent": "private-agent",
+                "$referer": "https://private.example/payload", "$browser": "private-client-metadata",
+                "$os": "private-client-metadata", "$device_model": "private-client-metadata",
+                "$language": "private-client-metadata", "$viewport": "private-client-metadata",
+                "referer": "private-client-metadata", "browser": "private-client-metadata",
+                "category": "docs"}
+        });
+        let headers = [
+            ("user-agent", "private-agent"),
+            ("x-forwarded-for", "1.2.3.4"),
+        ];
+        for _ in 0..2 {
+            assert_eq!(
+                track_with_headers(&state, &payload, &headers).await,
+                StatusCode::OK
+            );
+        }
+
+        let rows = query_env(
+            &state,
+            "SELECT distinct_id, anonymous_id, session_id, device_id, identity_uuid, CAST(properties AS VARCHAR) AS properties, mode FROM events",
+        )
+        .await;
+        assert_eq!(rows.len(), 2);
+        let distinct_id = rows[0]["distinct_id"].as_str().unwrap();
+        assert!(distinct_id.starts_with("audience_"), "{distinct_id}");
+        assert_eq!(rows[1]["distinct_id"], distinct_id);
+        for row in &rows {
+            assert!(row["anonymous_id"].is_null());
+            assert!(row["session_id"].is_null());
+            assert!(row["device_id"].is_null());
+            assert!(!row["identity_uuid"].is_null());
+            assert_eq!(row["mode"], "audience");
+            let properties: serde_json::Value =
+                serde_json::from_str(row["properties"].as_str().unwrap()).unwrap();
+            assert_eq!(
+                properties,
+                serde_json::json!({"$url": "https://example.com/docs", "category": "docs"})
+            );
+        }
+
+        let identities = query_env(&state, "SELECT is_identified FROM identities").await;
+        assert_eq!(identities.len(), 1);
+        assert_eq!(identities[0]["is_identified"], "false");
+    }
+
+    #[tokio::test]
+    async fn audience_visitor_ids_differ_per_client() {
+        let state = make_state();
+        let payload = serde_json::json!({"event": "view", "mode": "audience", "properties": {}});
+        for ip in ["1.2.3.4", "1.2.3.5"] {
+            track_with_headers(&state, &payload, &[("x-forwarded-for", ip)]).await;
+        }
+        let rows = query_env(&state, "SELECT DISTINCT distinct_id FROM events").await;
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn audience_identity_fields_reject_the_whole_batch() {
+        let state = make_state();
+        let product =
+            serde_json::json!({"event": "product", "distinct_id": "user", "properties": {}});
+        let audience =
+            serde_json::json!({"event": "audience", "mode": "audience", "properties": {}});
+        for field in ["distinct_id", "anonymous_id", "session_id", "device_id"] {
+            let mut invalid = audience.clone();
+            invalid[field] = "forbidden".into();
+            let response = make_router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/track")
+                        .header("X-API-Key", TEST_API_KEY)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            serde_json::json!([product, invalid]).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{field}");
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                body,
+                serde_json::json!({"ok": false, "error_code": "audience-identity-not-allowed"})
+            );
+            assert!(query_env(&state, "SELECT 1 FROM events").await.is_empty());
+        }
+
+        assert_eq!(
+            track_with_headers(&state, &serde_json::json!([product, audience]), &[]).await,
+            StatusCode::OK
+        );
+        let rows = query_env(&state, "SELECT event, mode FROM events ORDER BY event").await;
+        assert_eq!(
+            rows,
+            vec![
+                serde_json::json!({"event": "audience", "mode": "audience"}),
+                serde_json::json!({"event": "product", "mode": "product"}),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn product_mode_is_the_default_and_keeps_identity_fields() {
+        let state = make_state();
+        for mode in [None, Some("product")] {
+            let mut payload = serde_json::json!({"event": "e", "anonymous_id": "anon-only", "properties": {"$ip": "1.2.3.4"}});
+            if let Some(mode) = mode {
+                payload["mode"] = mode.into();
+            }
+            assert_eq!(
+                track_with_headers(&state, &payload, &[]).await,
+                StatusCode::OK
+            );
+        }
+        let rows = query_env(
+            &state,
+            "SELECT distinct_id, anonymous_id, CAST(properties AS VARCHAR) AS properties, mode FROM events",
+        )
+        .await;
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            assert!(row["distinct_id"].is_null());
+            assert_eq!(row["anonymous_id"], "anon-only");
+            assert_eq!(row["properties"], r#"{"$ip":"1.2.3.4"}"#);
+            assert_eq!(row["mode"], "product");
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_modes_are_rejected() {
+        let payload = serde_json::json!({"event": "e", "mode": "unsupported", "properties": {}});
+        assert_eq!(
+            track_with_headers(&make_state(), &payload, &[]).await,
+            StatusCode::UNPROCESSABLE_ENTITY
         );
     }
 
