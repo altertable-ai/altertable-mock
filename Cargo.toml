@@ -32,6 +32,10 @@ anyhow = "1.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1.0", features = ["raw_value"] }
 chrono = { version = "0.4.41", features = ["serde"] }
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+url = "2"
 
 [lints.clippy]
 equatable_if_let = "warn"

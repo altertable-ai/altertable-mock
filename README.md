@@ -176,6 +176,14 @@ curl -H "X-API-Key: myapikey" -X POST http://localhost:15001/track \
 | `device_id`    | string           | no       | Device identifier                                                  |
 | `session_id`   | string           | no       | Session identifier                                                 |
 | `timestamp`    | string or number | no       | ISO 8601 string or Unix timestamp in milliseconds; defaults to now |
+| `mode`         | string           | no       | `product` (default) or `audience`; see below                       |
+
+With `"mode": "audience"`, the event is collected without identity: `distinct_id`,
+`anonymous_id`, `device_id` and `session_id` are rejected with `400`
+(`audience-identity-not-allowed`, the whole batch is refused), a `distinct_id` is derived
+from a daily-rotating salted HMAC of the API key, `$url` hostname, client IP and
+user agent, and IP, geo, user-agent, referer, device and language properties are dropped.
+The mode is stored in the `mode` column of `events`.
 
 **`POST /identify`**
 

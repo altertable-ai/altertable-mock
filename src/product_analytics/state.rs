@@ -37,7 +37,8 @@ impl EnvironmentState {
                 device_id VARCHAR,
                 session_id VARCHAR,
                 identity_uuid VARCHAR,
-                identity_traits JSON
+                identity_traits JSON,
+                mode VARCHAR
             );
 
             CREATE TABLE IF NOT EXISTS identities (
@@ -75,6 +76,8 @@ pub type EnvironmentStore = Arc<RwLock<HashMap<String, Arc<Mutex<EnvironmentStat
 pub struct ProductAnalyticsState {
     pub environment_store: EnvironmentStore,
     pub allowed_api_keys: Arc<std::collections::HashSet<String>>,
+    /// Daily salts used to derive audience visitor ids, keyed by Unix day.
+    pub audience_salts: Arc<Mutex<HashMap<i64, [u8; 32]>>>,
 }
 
 impl ProductAnalyticsState {
@@ -92,6 +95,7 @@ impl ProductAnalyticsState {
         Self {
             environment_store: Arc::new(RwLock::new(store)),
             allowed_api_keys,
+            audience_salts: Arc::default(),
         }
     }
 
