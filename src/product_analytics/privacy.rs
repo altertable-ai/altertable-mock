@@ -61,7 +61,6 @@ pub fn strip_sensitive_properties(properties: &mut serde_json::Map<String, serde
                 | "region"
                 | "city"
                 | "user_agent"
-                | "referer"
                 | "browser"
                 | "browser_version"
                 | "os"
@@ -129,7 +128,6 @@ mod tests {
             "region",
             "city",
             "user_agent",
-            "referer",
             "browser",
             "browser_version",
             "os",
@@ -147,11 +145,16 @@ mod tests {
             properties.insert(format!("${key}"), "private".into());
         }
         properties.insert("$url".into(), "https://example.com/docs".into());
+        properties.insert("$referer".into(), "https://google.com/".into());
         properties.insert("category".into(), "documentation".into());
         strip_sensitive_properties(&mut properties);
         assert_eq!(
             serde_json::Value::Object(properties),
-            serde_json::json!({"$url": "https://example.com/docs", "category": "documentation"})
+            serde_json::json!({
+                "$url": "https://example.com/docs",
+                "$referer": "https://google.com/",
+                "category": "documentation"
+            })
         );
     }
 
