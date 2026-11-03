@@ -1426,15 +1426,15 @@ mod tests {
             "event": "$pageview", "mode": "audience",
             "properties": {"$url": "https://example.com/docs", "$ip": "1.2.3.4",
                 "$country": "FR", "$city": "Paris", "$user_agent": "private-agent",
-                "$referer": "https://private.example/payload", "$browser": "private-client-metadata",
+                "$referer": "https://google.com/", "$browser": "private-client-metadata",
                 "$os": "private-client-metadata", "$device_model": "private-client-metadata",
                 "$language": "private-client-metadata", "$viewport": "private-client-metadata",
-                "referer": "private-client-metadata", "browser": "private-client-metadata",
-                "category": "docs"}
+                "browser": "private-client-metadata", "category": "docs"}
         });
         let headers = [
             ("user-agent", "private-agent"),
             ("x-forwarded-for", "1.2.3.4"),
+            ("referer", "https://private.example/header"),
         ];
         for _ in 0..2 {
             assert_eq!(
@@ -1460,9 +1460,14 @@ mod tests {
             assert_eq!(row["mode"], "audience");
             let properties: serde_json::Value =
                 serde_json::from_str(row["properties"].as_str().unwrap()).unwrap();
+            // The client-provided referrer is kept, but the Referer header is never used.
             assert_eq!(
                 properties,
-                serde_json::json!({"$url": "https://example.com/docs", "category": "docs"})
+                serde_json::json!({
+                    "$url": "https://example.com/docs",
+                    "$referer": "https://google.com/",
+                    "category": "docs"
+                })
             );
         }
 
