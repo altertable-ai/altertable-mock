@@ -51,7 +51,7 @@ RUN set -eu; \
         esac ;; \
       *) echo "unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;; \
     esac; \
-    curl -fsSL "https://github.com/duckdb/duckdb/releases/download/v2.0.0/duckdb-cli-linux-${arch}.tar.gz" \
+    curl -fsSL "https://github.com/duckdb/duckdb/releases/download/v2.0.1/duckdb-cli-linux-${arch}.tar.gz" \
       | tar -xz -C /tmp duckdb; \
     /tmp/duckdb -c "INSTALL ducklake; INSTALL semantic_layer FROM community;"; \
     rm /tmp/duckdb
