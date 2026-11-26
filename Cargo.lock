@@ -758,8 +758,8 @@ dependencies = [
 
 [[package]]
 name = "duckdb"
-version = "1.20000.0"
-source = "git+https://github.com/altertable-ai/duckdb-rs?rev=1401eeddcc024f5a32a041dff5e8749263bee475#1401eeddcc024f5a32a041dff5e8749263bee475"
+version = "1.20001.0"
+source = "git+https://github.com/altertable-ai/duckdb-rs?rev=94e5f807d4986c0e22bd5c1f612ef42771c3fa2e#94e5f807d4986c0e22bd5c1f612ef42771c3fa2e"
 dependencies = [
  "arrow",
  "cast",
@@ -1450,8 +1450,8 @@ checksum = "2874a2af47a2325c2001a6e6fad9b16a53b802102b528163885171cf92b15976"
 
 [[package]]
 name = "libduckdb-sys"
-version = "1.20000.0"
-source = "git+https://github.com/altertable-ai/duckdb-rs?rev=1401eeddcc024f5a32a041dff5e8749263bee475#1401eeddcc024f5a32a041dff5e8749263bee475"
+version = "1.20001.0"
+source = "git+https://github.com/altertable-ai/duckdb-rs?rev=94e5f807d4986c0e22bd5c1f612ef42771c3fa2e#94e5f807d4986c0e22bd5c1f612ef42771c3fa2e"
 dependencies = [
  "flate2",
  "pkg-config",
